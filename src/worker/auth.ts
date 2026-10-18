@@ -115,6 +115,22 @@ export function authPage(
     { headers },
   );
 }
+
+// Only use provider-validated callbacks. Finish the POST before navigating past Chromium's form-action restriction.
+export function oauthCallbackPage(
+  redirectTo: string,
+  headers: Headers,
+): Response {
+  headers.delete("Location");
+  headers.set("Referrer-Policy", "no-referrer");
+  const destination = escapeHtml(redirectTo);
+  return authPage(
+    "Returning to your agent",
+    `<meta http-equiv="refresh" content="0;url=${destination}"><p>Your choice was saved. Returning to your agent…</p><a class="button" href="${destination}">Continue to agent</a>`,
+    headers,
+  );
+}
+
 export async function beginGoogle(
   request: Request,
   env: AppEnv,

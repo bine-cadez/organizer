@@ -9,10 +9,12 @@ import {
   authPage,
   beginGoogle,
   calendarScopes,
+  escapeHtml,
   finishGoogle,
   getSession,
   localDevelopment,
   logout,
+  oauthCallbackPage,
   requireBrowserWrite,
   type Session,
 } from "../src/worker/auth";
@@ -499,4 +501,38 @@ describe("owner browser authentication", () => {
     );
     expect(response.headers.get("X-Frame-Options")).toBe("DENY");
   });
+
+  it.each([
+    "code=opaque-code&state=client-state",
+    "error=access_denied&state=client-state",
+  ])(
+    "finishes consent before callback navigation while preserving cookie cleanup: %s",
+    async (query) => {
+      const destination = `https://client.example/callback?${query}`;
+      const response = oauthCallbackPage(
+        destination,
+        new Headers({
+          "Set-Cookie":
+            "__Host-oauth-consent-fixture=; Secure; Path=/; Max-Age=0",
+          Location: destination,
+        }),
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.has("Location")).toBe(false);
+      expect(response.headers.get("Set-Cookie")).toContain("Max-Age=0");
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+      expect(response.headers.get("Content-Security-Policy")).toContain(
+        "form-action 'self'",
+      );
+      expect(response.headers.get("X-Frame-Options")).toBe("DENY");
+      const body = await response.text();
+      expect(body).toContain(
+        `http-equiv="refresh" content="0;url=${escapeHtml(destination)}"`,
+      );
+      expect(body).toContain(
+        `href="${escapeHtml(destination)}">Continue to agent</a>`,
+      );
+    },
+  );
 });

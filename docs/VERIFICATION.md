@@ -2,7 +2,7 @@
 
 Local implementation verified 18 October 2026; deployment and database transfer verified 19 October 2026.
 
-- TypeScript passes. All **86 automated tests** pass across domain, alarm runner, authentication, providers, MCP, browser date helpers, and database transfer.
+- TypeScript passes. All **88 automated tests** pass across domain, alarm runner, authentication, providers, MCP, browser date helpers, and database transfer.
 - Production Vite build and Cloudflare Worker deployment dry run pass. Local startup profiling completed successfully.
 - **25 real HTTP checks** pass on isolated SQLite Durable Object storage: CSRF, persistence, place conflicts/swap preview/commit, lifecycle guards, pages, direct learning, staged/final reviews, exact retry, final-review rejection, missing Calendar connection, MCP initialization, 47-tool discovery, and shared agent writes.
 - Production-mode runtime rejects anonymous API and MCP access and publishes OAuth discovery with the required read scope and optional authorization capabilities.
@@ -16,7 +16,13 @@ The production Worker and static assets deployed successfully at https://organiz
 
 Production Google credentials were installed privately from the downloaded client JSON. Checks confirm Google login is configured, uses the new client, redirects to the exact HTTPS callback, and requests identity-only scopes for owner login. The pinned owner subject and encryption key were preserved. Live sign-in and both calendar reconnects still require owner interaction.
 
-The GitHub Actions workflow is prepared for checks and main-branch deployment with production concurrency and a deployed HTTP check. The owner confirmed saving the CI token and will push commits personally. The first hosted run remains pending that push; local checks do not establish a successful GitHub deployment.
+The owner confirmed production sign-in and both calendar connections. The [first GitHub Actions run](https://github.com/bine-cadez/organizer/actions/runs/39173442876) passed both checks and deployment, including the deployed HTTP check. Google configuration remained present afterward. Publishing remains owner-managed.
+
+## MCP consent callback regression, 19 October 2026
+
+An isolated headless Brave session reproduced a POST reaching the authorization server while its 302 callback was blocked by the consent page's `form-action 'self'` policy. This matches [Chromium's enforcement of form-action on redirects](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/form-action). The provider had already consumed the one-use consent and saved the grant, so clicking Allow again failed browser-binding validation.
+
+Approval and denial now finish with a no-cache HTML handoff that navigates to the provider-validated callback and offers a Continue to agent link. The form policy, cookie cleanup, and framing restrictions remain. Regression tests cover both outcomes and the preserved headers. The isolated Brave check confirmed a single click reaches the external callback with the fix. TypeScript, all tests, frontend build, and Worker dry run pass. Production retest requires the owner's push and a fresh client authorization flow.
 
 Review captures with isolated test data: [desktop Board](preview/board-desktop.png) and [mobile Today](preview/today-mobile.png).
 

@@ -18,6 +18,7 @@ import {
   googleConfigured,
   localDevelopment,
   logout,
+  oauthCallbackPage,
   requireBrowserWrite,
   type Session,
 } from "./auth";
@@ -32,7 +33,10 @@ app.use("*", async (c, next) => {
   c.set("session", await getSession(c.req.raw, c.env));
   await next();
   c.header("X-Content-Type-Options", "nosniff");
-  c.header("Referrer-Policy", "same-origin");
+  c.header(
+    "Referrer-Policy",
+    c.res.headers.get("Referrer-Policy") || "same-origin",
+  );
   if (c.req.path.startsWith("/api/") || c.req.path.startsWith("/auth/"))
     c.header("Cache-Control", "no-store");
 });
@@ -265,7 +269,7 @@ app.post("/authorize", async (c) => {
     handle = String(form.get("handle") || "");
   if (form.get("decision") !== "approve") {
     const denied = await oauth.denyConsent(c.req.raw, handle);
-    return new Response(null, { status: 302, headers: denied.headers });
+    return oauthCallbackPage(denied.redirectTo, denied.headers);
   }
   const approved = await oauth.approveConsent(c.req.raw, handle, {
     scope: form
@@ -284,8 +288,7 @@ app.post("/authorize", async (c) => {
       actorId: crypto.randomUUID(),
     },
   });
-  approved.headers.set("Location", result.redirectTo);
-  return new Response(null, { status: 302, headers: approved.headers });
+  return oauthCallbackPage(result.redirectTo, approved.headers);
 });
 app.get("/api/health", (c) => c.json({ ok: true }));
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
