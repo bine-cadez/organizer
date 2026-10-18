@@ -59,13 +59,13 @@ There are 47 tools, scoped resources, and five workflow prompts. Agents can insp
 
 ## Cloudflare deployment
 
-Production is hosted at **https://organizer.property-scraper.workers.dev**. The owner's current local database was transferred on 19 October 2026; all 19 domain tables matched the frozen backup and passed reference checks. Google production credentials are the remaining sign-in setup step.
+Production is hosted at **https://organizer.property-scraper.workers.dev**. The owner's current local database was transferred on 19 October 2026; all 19 domain tables matched the frozen backup and passed reference checks. Production Google credentials are installed as Cloudflare secrets, with the verified owner identity pinned and the original encryption key preserved. The owner must sign in and reconnect both calendars with the new Google client.
 
 `wrangler.jsonc` identifies the production Worker, existing SQLite Durable Object namespace binding, OAuth KV namespace, and canonical HTTPS origin. Keep these identities stable across releases. Local development continues to use separate storage in `.wrangler/state`.
 
 Set production credentials through Cloudflare secrets, independently of `.dev.vars`. Preserve the encryption key used for the imported Calendar credentials, pin `OWNER_GOOGLE_SUB` to the verified owner identity, and configure the production Google client callback as `https://organizer.property-scraper.workers.dev/auth/callback`. A different Google client requires reconnecting each Calendar account.
 
-The [GitHub Actions workflow](.github/workflows/deploy.yml) checks pull requests and pushes to `main`. After checks pass, `main` deploys to the existing production resources and runs `npm run deploy:verify`. Deployments are serialized. Add a deployment-scoped `CLOUDFLARE_API_TOKEN` as a GitHub production-environment secret to enable deployment. Google credentials and the encryption key stay in Cloudflare; the pipeline never imports or resets the database. The first GitHub run is pending credential setup.
+The [GitHub Actions workflow](.github/workflows/deploy.yml) checks pull requests and pushes to `main`. After checks pass, `main` deploys to the existing production resources and runs `npm run deploy:verify`. Deployments are serialized. The owner confirmed saving `CLOUDFLARE_API_TOKEN` in the GitHub production environment. Google credentials and the encryption key stay in Cloudflare; the pipeline never imports or resets the database. The first hosted run is pending the owner's push. Publishing remains owner-managed; no additional GitHub access is authorized for the agent.
 
 For a manual release, run `npm run check`, `npm run deploy:check`, `npm run deploy`, and `npm run deploy:verify`. The deployment verification checks the app shell, anonymous API/MCP rejection, and OAuth discovery; it does not perform a Google login or write Calendar events.
 

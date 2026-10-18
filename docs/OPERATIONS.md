@@ -1,6 +1,6 @@
 # Organizer operations
 
-The app and the owner's current database are deployed to Cloudflare at https://organizer.property-scraper.workers.dev. The authorized database transfer completed on 19 October 2026. Production Google sign-in and the first GitHub deployment run are pending credential setup. See the [README](../README.md) for commands and secrets.
+The app and the owner's current database are deployed to Cloudflare at https://organizer.property-scraper.workers.dev. The authorized database transfer completed on 19 October 2026. Production Google secrets are installed; the owner must complete sign-in and reconnect both calendars. The owner confirmed saving the CI token; the first hosted pipeline run awaits the owner's push. See the [README](../README.md) for commands and secrets.
 
 ## Storage and recovery
 
@@ -32,7 +32,7 @@ Before release, rehearse restoration with disposable staging data. Confirm saved
 
 Pull requests run TypeScript, automated tests, the frontend build, and a Worker dry run. Successful pushes to `main` deploy the Worker and assets, then check the deployed authentication boundary and MCP discovery. Configure `CLOUDFLARE_API_TOKEN` in the GitHub `production` environment using a token scoped to this Cloudflare account. Runtime Google credentials and the encryption key remain Cloudflare secrets. Never use the interactive Wrangler OAuth session as a CI credential.
 
-The owner rejected account-wide GitHub authorization. Publish commits using the owner's own Git setup or a fine-grained credential restricted to `bine-cadez/organizer` with Contents and Workflows write permissions. Do not request broader GitHub OAuth access for deployment. The workflow itself has only `contents: read` GitHub permissions.
+The owner rejected account-wide GitHub authorization and chose to push commits personally, with no additional GitHub access for the agent. Do not request broader GitHub OAuth access for deployment. If the owner's Git client rejects workflow-file pushes, the owner can use SSH or a fine-grained credential restricted to `bine-cadez/organizer` with Contents and Workflows write permissions. Such credentials stay in the owner's Git setup. The workflow itself has only `contents: read` GitHub permissions.
 
 Deployment retains the existing Durable Object and KV bindings. Schema changes need an explicit compatible migration; a code rollback does not restore database state or reverse Google Calendar changes. Inspect GitHub Actions and Cloudflare deployment logs for a failed release before retrying.
 

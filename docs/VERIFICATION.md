@@ -14,7 +14,9 @@ All fixtures remained in isolated temporary stores. The normal database contains
 
 The production Worker and static assets deployed successfully at https://organizer.property-scraper.workers.dev. Its SQLite Durable Object and OAuth KV namespace were provisioned. The owner's local app was stopped before the final private SQLite backup. All 19 imported domain tables matched the backup SHA-256 checksum, including versions, receipts, audit history and encrypted Calendar credentials; remote foreign-key checks returned no failures. The deployed app rejects anonymous API and MCP access, reports development bypass disabled, and publishes the correct OAuth/PKCE discovery metadata.
 
-The GitHub Actions workflow is prepared for checks and main-branch deployment with production concurrency and a deployed HTTP check. Its first hosted run and production Google login remain pending credentials; local checks do not establish those outcomes.
+Production Google credentials were installed privately from the downloaded client JSON. Checks confirm Google login is configured, uses the new client, redirects to the exact HTTPS callback, and requests identity-only scopes for owner login. The pinned owner subject and encryption key were preserved. Live sign-in and both calendar reconnects still require owner interaction.
+
+The GitHub Actions workflow is prepared for checks and main-branch deployment with production concurrency and a deployed HTTP check. The owner confirmed saving the CI token and will push commits personally. The first hosted run remains pending that push; local checks do not establish a successful GitHub deployment.
 
 Review captures with isolated test data: [desktop Board](preview/board-desktop.png) and [mobile Today](preview/today-mobile.png).
 

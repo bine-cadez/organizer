@@ -2,7 +2,7 @@
 
 Updated 19 October 2026. Owner and tech lead: Bine Čadež.
 
-The tech lead approved the consolidated specifications and said “i approve create the app now” on 18 October 2026. The app is implemented. The owner subsequently authorized deployment of the current database followed by CI/CD on pushes to `main`. Production resources and the verified database transfer are now in place; production authentication and CI credentials remain setup steps. The original handoff remains reference material; it cannot override the owner's decisions.
+The tech lead approved the consolidated specifications and said “i approve create the app now” on 18 October 2026. The app is implemented. The owner subsequently authorized deployment of the current database followed by CI/CD on pushes to `main`. Production resources, the verified database transfer, and Google secret configuration are in place. The owner confirmed saving the CI token and chose to push commits personally. Live sign-in, calendar reconnect, and the first hosted pipeline run remain verification steps. The original handoff remains reference material; it cannot override the owner's decisions.
 
 ## Approved direction
 
@@ -21,7 +21,7 @@ The tech lead approved the consolidated specifications and said “i approve cre
 | A11 | Saved reviews are final and cannot be edited | Owner explicitly chose final reviews, replacing the handoff's reopen-and-edit behavior |
 | A12 | Agents may capture learnings directly on a project or book, outside review | Owner explicitly approved direct capture |
 | A13 | Deploy the current database first, then deploy automatically after successful checks on pushes to `main` | Owner's deployment instruction |
-| A14 | No account-wide GitHub authorization for publishing; use owner-managed pushes or a repository-limited credential | Owner rejected broad GitHub access on 19 October 2026 |
+| A14 | Owner-managed pushes; no additional GitHub access for the agent | Owner rejected broad GitHub access and explicitly chose to push personally on 19 October 2026 |
 
 The detailed [technical specification](TECH_SPEC.md), [data model](DATA_MODEL.md), and [MCP contract](MCP.md), including P01–P21 below, were approved by the instruction to create the app. Historical “proposed” wording records their origin; it no longer denotes an outstanding approval.
 
