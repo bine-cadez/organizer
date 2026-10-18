@@ -20,6 +20,8 @@ The tech lead approved the consolidated specifications and said “i approve cre
 | A10 | Fixed Europe/Ljubljana planning timezone during travel; 04:00 review cutoff | Owner explicitly chose the fixed-zone option |
 | A11 | Saved reviews are final and cannot be edited | Owner explicitly chose final reviews, replacing the handoff's reopen-and-edit behavior |
 | A12 | Agents may capture learnings directly on a project or book, outside review | Owner explicitly approved direct capture |
+| A13 | Deploy the current database first, then deploy automatically after successful checks on pushes to `main` | Owner's deployment instruction |
+| A14 | No account-wide GitHub authorization for publishing; use owner-managed pushes or a repository-limited credential | Owner rejected broad GitHub access on 19 October 2026 |
 
 The detailed [technical specification](TECH_SPEC.md), [data model](DATA_MODEL.md), and [MCP contract](MCP.md), including P01–P21 below, were approved by the instruction to create the app. Historical “proposed” wording records their origin; it no longer denotes an outstanding approval.
 
