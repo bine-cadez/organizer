@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "organizer",
+  "account_id": "df6503c5056ff3b000df3ade0e7a0913",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-10-18",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": "dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/api/*",
+      "/auth/*",
+      "/mcp",
+      "/mcp/*",
+      "/authorize",
+      "/token",
+      "/register",
+      "/revoke",
+      "/.well-known/*",
+    ],
+  },
+  "vars": {
+    "ENVIRONMENT": "production",
+    "APP_NAME": "Organizer",
+    "APP_ORIGIN": "https://organizer.property-scraper.workers.dev",
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "ORGANIZER", "class_name": "OrganizerStore" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["OrganizerStore"] }],
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "c053460b98684adca8513849255fa520" },
+  ],
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+}

@@ -1,0 +1,10 @@
+# Copy to .dev.vars and fill these in to use real Google sign-in/calendars.
+# Local loopback development works without them; deployed requests never bypass login.
+GOOGLE_CLIENT_ID=""
+GOOGLE_CLIENT_SECRET=""
+OWNER_EMAIL=""
+OWNER_GOOGLE_SUB=""
+# Generate independently: openssl rand -base64 32
+TOKEN_ENCRYPTION_KEY=""
+# Identify catalogue requests to Open Library with your real contact email.
+CONTACT_EMAIL=""
