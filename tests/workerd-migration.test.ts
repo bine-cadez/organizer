@@ -143,4 +143,66 @@ describe("workerd books migration", () => {
       { n: 1 },
     ]);
   }, 30000);
+
+  it("re-enables foreign keys when the first event after migration is an alarm", async () => {
+    server = createTestHarness({
+      root,
+      workers: [
+        {
+          config: {
+            ...workerConfig,
+            main: path.join(root, "seed-worker.js"),
+          },
+        },
+      ],
+    });
+    await server.listen();
+    const seeded = await server.fetch("http://example.com/");
+    expect(seeded.status).toBe(200);
+
+    await server
+      .getWorker()
+      .evictDurableObject("OrganizerStore", { name: "owner" });
+    await server.update({
+      root,
+      workers: [
+        {
+          config: {
+            ...workerConfig,
+            main: path.join(root, "alarm-worker.ts"),
+          },
+        },
+      ],
+    });
+
+    // Migration runs in this request, and the only write after it is setAlarm.
+    // The alarm that fires next is the first event after migration.
+    const armed = await server.fetch("http://example.com/arm");
+    expect(armed.status, await armed.clone().text()).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    expect(await rows(server, "SELECT note FROM alarm_marker")).toEqual([
+      { note: "ran" },
+    ]);
+    expect(await rows(server, "PRAGMA foreign_keys")).toEqual([
+      { foreign_keys: 1 },
+    ]);
+    await expect(
+      rows(
+        server,
+        "INSERT INTO queue_entries(id,area_id,position,book_id) VALUES('queue_bad','tech',1,'missing-book')",
+      ),
+    ).rejects.toThrow(/FOREIGN KEY constraint failed/);
+    expect(
+      await rows(server, "SELECT id FROM queue_entries WHERE id='queue_bad'"),
+    ).toEqual([]);
+    expect(await rows(server, "PRAGMA foreign_key_check")).toEqual([]);
+    expect(
+      await rows(server, "SELECT id FROM books ORDER BY id"),
+    ).toEqual([
+      { id: "book_meditations" },
+      { id: "book_mom" },
+      { id: "book_odyssey" },
+    ]);
+  }, 30000);
 });
