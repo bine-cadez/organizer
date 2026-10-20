@@ -181,7 +181,27 @@ export class OrganizerEngine {
         throw new Error(
           "Could not disable foreign keys before rebuilding books. Existing books were left unchanged.",
         );
+      // foreign_keys is connection-scoped, so a rollback leaves it off. Restore
+      // it even when the schema transaction throws before the books rebuild.
+      try {
+        this.installSchema();
+        this.rebuildBooksTable();
+        this.db.run(
+          "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,?)",
+          this.now(),
+        );
+      } finally {
+        this.db.run("PRAGMA foreign_keys=ON");
+      }
+    } else {
+      this.installSchema();
+      this.db.run(
+        "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,?)",
+        this.now(),
+      );
     }
+  }
+  private installSchema() {
     this.db.transaction(() => {
       for (const sql of SCHEMA) this.db.run(sql);
       this.db.run(
@@ -215,11 +235,6 @@ export class OrganizerEngine {
           );
       }
     });
-    if (rebuildBooks) this.rebuildBooksTable();
-    this.db.run(
-      "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,?)",
-      this.now(),
-    );
   }
   private foreignKeysEnabled() {
     return Number(this.db.all("PRAGMA foreign_keys")[0]?.foreign_keys) === 1;

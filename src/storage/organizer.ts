@@ -23,41 +23,43 @@ export class OrganizerStore extends DurableObject<AppEnv> {
   private engine: OrganizerEngine;
   private syncing = new Map<string, Promise<void>>();
   private refreshing = new Map<CalendarRole, Promise<GoogleCredentials>>();
+  // The books rebuild turns foreign keys off before the first write. workerd
+  // ignores PRAGMA foreign_keys=ON until a later event, and only when that
+  // pragma runs before the event's first write. schemaReady stays false while
+  // the engine migrates so this retry does not undo the rebuild.
+  private schemaReady = false;
+  private foreignKeysOn = false;
   constructor(ctx: DurableObjectState, env: AppEnv) {
     super(ctx, env);
-    // The books rebuild turns foreign keys off before the first write. workerd
-    // ignores PRAGMA foreign_keys=ON until the next event, so every later SQL
-    // entry tries again and only stops once the readback is on.
-    let schemaReady = false;
-    let foreignKeysOn = false;
-    const ensureForeignKeys = () => {
-      if (!schemaReady || foreignKeysOn) return;
-      ctx.storage.sql.exec("PRAGMA foreign_keys=ON");
-      foreignKeysOn =
-        Number(
-          ctx.storage.sql.exec("PRAGMA foreign_keys").toArray()[0]
-            ?.foreign_keys,
-        ) === 1;
-    };
     const db: DbPort = {
       all: (sql, ...bindings) => {
-        ensureForeignKeys();
+        this.ensureForeignKeys();
         return ctx.storage.sql.exec(sql, ...bindings).toArray();
       },
       run: (sql, ...bindings) => {
-        ensureForeignKeys();
+        this.ensureForeignKeys();
         ctx.storage.sql.exec(sql, ...bindings).toArray();
       },
       transaction: (callback) => {
-        ensureForeignKeys();
+        this.ensureForeignKeys();
         return ctx.storage.transactionSync(callback);
       },
     };
     this.engine = new OrganizerEngine(db);
-    schemaReady = true;
-    ensureForeignKeys();
+    this.schemaReady = true;
+    this.ensureForeignKeys();
+  }
+  private ensureForeignKeys() {
+    if (!this.schemaReady || this.foreignKeysOn) return;
+    this.ctx.storage.sql.exec("PRAGMA foreign_keys=ON");
+    this.foreignKeysOn =
+      Number(
+        this.ctx.storage.sql.exec("PRAGMA foreign_keys").toArray()[0]
+          ?.foreign_keys,
+      ) === 1;
   }
   snapshot() {
+    this.ensureForeignKeys();
     return this.engine.snapshot();
   }
   private requestedRange(
@@ -148,6 +150,7 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     );
   }
   async execute(name: string, args: Record<string, unknown>, actor: Actor) {
+    this.ensureForeignKeys();
     try {
       const replay = this.engine.replayReceipt(name, args, actor);
       if (replay !== undefined) return replay;
@@ -238,15 +241,18 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     }
   }
   async skipSetup() {
+    this.ensureForeignKeys();
     this.engine.skipSetup();
     return this.engine.snapshot();
   }
   async connectAccount(input: AccountInput) {
+    this.ensureForeignKeys();
     const result = this.engine.connectAccount(input);
     await this.ctx.storage.setAlarm(Date.now() + 100);
     return result;
   }
   async catalogPermit(identified: boolean): Promise<number> {
+    this.ensureForeignKeys();
     const now = Date.now(),
       previous = this.ctx.storage.kv.get<number>("catalog:next") || 0;
     const next = Math.max(now, previous);
@@ -413,9 +419,15 @@ export class OrganizerStore extends DurableObject<AppEnv> {
       : snapshot.connections.some((c) => c.status === "connected")
         ? Date.now() + 300000
         : null;
-    if (next !== null) await this.ctx.storage.setAlarm(next);
+    if (next !== null) {
+      this.ensureForeignKeys();
+      await this.ctx.storage.setAlarm(next);
+    }
   }
   async alarm() {
+    // setAlarm writes. On workerd that opens the event's implicit transaction
+    // and every later PRAGMA foreign_keys=ON is ignored, so re-enable first.
+    this.ensureForeignKeys();
     await this.ctx.storage.setAlarm(Date.now() + 60000);
     try {
       for (const operation of this.engine.dueOperations(10)) {

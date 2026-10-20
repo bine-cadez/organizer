@@ -221,6 +221,91 @@ describe("database transfer", () => {
         ?.currentPage,
     ).toBe(41);
   });
+  it("turns foreign keys back on when the schema transaction fails", () => {
+    const db = new DatabaseSync(":memory:");
+    open.push(db);
+    db.exec("PRAGMA foreign_keys=ON");
+    db.exec(
+      `CREATE TABLE areas(id TEXT PRIMARY KEY CHECK(id IN ('tech','sales','ship','self')), code TEXT NOT NULL, name TEXT NOT NULL, full_name TEXT NOT NULL)`,
+    );
+    db.exec(
+      `INSERT INTO areas(id,code,name,full_name) VALUES('self','G','General','General Self-improvement')`,
+    );
+    db.exec(
+      `CREATE TABLE books(id TEXT PRIMARY KEY, area_id TEXT NOT NULL REFERENCES areas(id), title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 120), authors_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(authors_json) AND json_type(authors_json)='array'), work_id TEXT, edition_id TEXT, isbn TEXT, cover_url TEXT, cover_id TEXT, page_count INTEGER NOT NULL CHECK(page_count>0 AND page_count<=100000), page_count_source TEXT NOT NULL CHECK(page_count_source IN ('edition','work_median','manual')), current_page INTEGER NOT NULL DEFAULT 0 CHECK(current_page>=0 AND current_page<=page_count), state TEXT NOT NULL CHECK(state IN ('queued','active','paused','archived','done')), started_at INTEGER, paused_at INTEGER, archived_at INTEGER, done_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1 CHECK(version>0))`,
+    );
+    db.prepare(
+      `INSERT INTO books(id,area_id,title,authors_json,page_count,page_count_source,current_page,state,created_at,updated_at,version) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      "book_old",
+      "self",
+      "Meditations",
+      '["Marcus Aurelius"]',
+      254,
+      "manual",
+      40,
+      "active",
+      1,
+      1,
+      3,
+    );
+    const port = {
+      all: (sql, ...params) => db.prepare(sql).all(...params),
+      run: (sql, ...params) => {
+        if (String(sql).includes("INTO settings"))
+          throw new Error("settings insert failed");
+        return db.prepare(sql).run(...params);
+      },
+      transaction: (fn) => {
+        db.exec("BEGIN");
+        try {
+          const value = fn();
+          db.exec("COMMIT");
+          return value;
+        } catch (error) {
+          db.exec("ROLLBACK");
+          throw error;
+        }
+      },
+    };
+    expect(
+      () =>
+        new OrganizerEngine(port, {
+          now: () => Date.parse("2026-10-19T08:00:00Z"),
+        }),
+    ).toThrow(/settings insert failed/);
+    expect(db.prepare("PRAGMA foreign_keys").get().foreign_keys).toBe(1);
+    expect(
+      db
+        .prepare("PRAGMA table_info(books)")
+        .all()
+        .map((column) => column.name),
+    ).toEqual([
+      "id",
+      "area_id",
+      "title",
+      "authors_json",
+      "work_id",
+      "edition_id",
+      "isbn",
+      "cover_url",
+      "cover_id",
+      "page_count",
+      "page_count_source",
+      "current_page",
+      "state",
+      "started_at",
+      "paused_at",
+      "archived_at",
+      "done_at",
+      "created_at",
+      "updated_at",
+      "version",
+    ]);
+    expect(
+      db.prepare("SELECT id, current_page, version FROM books").all(),
+    ).toEqual([{ id: "book_old", current_page: 40, version: 3 }]);
+  });
   it("round trips every domain table, including booking cycles, credentials, receipts and final reviews", () => {
     const source = fixture(),
       target = fixture();
