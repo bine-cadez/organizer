@@ -13,7 +13,8 @@ import type {
   Snapshot,
   Ticket,
 } from "../shared/types";
-import { SCHEMA } from "../storage/schema";
+import { progressPercent } from "../shared/duration";
+import { BOOK_INDEXES, BOOKS_DDL, SCHEMA } from "../storage/schema";
 import { DomainError } from "./errors";
 import {
   TIMEZONE,
@@ -199,6 +200,43 @@ export class OrganizerEngine {
           );
       }
     });
+    this.migrateBookProgress();
+  }
+  /**
+   * Schema version 2 adds audiobook progress. Fresh databases already have the
+   * columns. A version-1 books table is rebuilt in place; every existing row
+   * stays a page book with its page count and current page unchanged.
+   */
+  private migrateBookProgress() {
+    const columns = this.db
+      .all("PRAGMA table_info(books)")
+      .map((row) => String(row.name));
+    if (!columns.includes("progress_unit")) {
+      this.db.run("PRAGMA foreign_keys=OFF");
+      try {
+        this.db.transaction(() => {
+          this.db.run(
+            BOOKS_DDL.replace(
+              "CREATE TABLE IF NOT EXISTS books(",
+              "CREATE TABLE books__next(",
+            ),
+          );
+          this.db.run(
+            `INSERT INTO books__next(id,area_id,title,authors_json,work_id,edition_id,isbn,cover_url,cover_id,page_count,page_count_source,current_page,progress_unit,duration_minutes,position_minutes,state,started_at,paused_at,archived_at,done_at,created_at,updated_at,version)
+             SELECT id,area_id,title,authors_json,work_id,edition_id,isbn,cover_url,cover_id,page_count,page_count_source,current_page,'pages',NULL,0,state,started_at,paused_at,archived_at,done_at,created_at,updated_at,version FROM books`,
+          );
+          this.db.run("DROP TABLE books");
+          this.db.run("ALTER TABLE books__next RENAME TO books");
+          for (const sql of BOOK_INDEXES) this.db.run(sql);
+        });
+      } finally {
+        this.db.run("PRAGMA foreign_keys=ON");
+      }
+    }
+    this.db.run(
+      "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,?)",
+      this.now(),
+    );
   }
   private at() {
     return this.ctx?.at ?? this.now();
@@ -235,6 +273,43 @@ export class OrganizerEngine {
         { field },
       );
     return Number(value);
+  }
+  /** Hours 0–999 and minutes 0–59. `minTotal` is 1 for a length and 0 for a position. */
+  private clock(
+    value: unknown,
+    field: string,
+    minTotal: number,
+    maxTotal = 999 * 60 + 59,
+  ): number {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      this.fail(
+        "VALIDATION_ERROR",
+        `${field} must include hours and minutes.`,
+        { field },
+      );
+    const record = value as Row;
+    if (Object.keys(record).some((key) => key !== "hours" && key !== "minutes"))
+      this.fail(
+        "VALIDATION_ERROR",
+        `${field} only accepts hours and minutes.`,
+        { field },
+      );
+    const hours = this.integer(record.hours, `${field}.hours`, 0, 999);
+    const minutes = this.integer(record.minutes, `${field}.minutes`, 0, 59);
+    const total = hours * 60 + minutes;
+    if (total < minTotal)
+      this.fail("VALIDATION_ERROR", `${field} must be at least 1 minute.`, {
+        field,
+      });
+    if (total > maxTotal)
+      this.fail(
+        "VALIDATION_ERROR",
+        maxTotal === 999 * 60 + 59
+          ? `${field} must be at most 999 hours 59 minutes.`
+          : `${field} must stay within the audiobook.`,
+        { field },
+      );
+    return total;
   }
   private date(v: unknown): string {
     if (
@@ -365,9 +440,23 @@ export class OrganizerEngine {
       goal: r.goal ?? undefined,
       state: r.state,
       authors: kind === "book" ? parse(r.authors_json, []) : undefined,
-      pageCount: r.page_count,
-      pageCountSource: r.page_count_source,
-      currentPage: r.current_page,
+      progressUnit: kind === "book" ? (r.progress_unit ?? "pages") : undefined,
+      pageCount:
+        kind === "book" && r.progress_unit === "time"
+          ? undefined
+          : r.page_count,
+      pageCountSource:
+        kind === "book" && r.progress_unit === "time"
+          ? undefined
+          : r.page_count_source,
+      currentPage:
+        kind === "book" && r.progress_unit === "time"
+          ? undefined
+          : r.current_page,
+      durationMinutes:
+        r.progress_unit === "time" ? r.duration_minutes : undefined,
+      positionMinutes:
+        r.progress_unit === "time" ? r.position_minutes : undefined,
       coverUrl: r.cover_url ?? undefined,
       workId: r.work_id ?? undefined,
       editionId: r.edition_id ?? undefined,
@@ -1350,13 +1439,38 @@ export class OrganizerEngine {
       );
     const title = this.text(b.title, "title");
     const authors = this.authors(b.authors ?? []);
-    const count = a.pageCountOverride ?? b.pageCount;
-    if (count == null)
+    const unit = source.progressUnit ?? "pages";
+    if (unit !== "pages" && unit !== "time")
+      this.fail("VALIDATION_ERROR", "progressUnit must be pages or time.", {
+        field: "progressUnit",
+      });
+    if (unit === "time" && source.type !== "manual")
+      this.fail(
+        "VALIDATION_ERROR",
+        "Audiobooks are added by hand with a length in hours and minutes.",
+        { field: "progressUnit" },
+      );
+    const audiobook = unit === "time";
+    if (audiobook && (a.pageCountOverride != null || source.pageCount != null))
+      this.fail("VALIDATION_ERROR", "Audiobooks do not take a page count.", {
+        field: "pageCount",
+      });
+    if (!audiobook && source.duration != null)
+      this.fail("VALIDATION_ERROR", "Page books do not take a duration.", {
+        field: "duration",
+      });
+    const duration = audiobook
+      ? this.clock(source.duration, "duration", 1)
+      : null;
+    const count = audiobook ? null : (a.pageCountOverride ?? b.pageCount);
+    if (!audiobook && count == null)
       this.fail(
         "BOOK_METADATA_INCOMPLETE",
         "A positive page count is required.",
       );
-    const pages = this.integer(count, "pageCount", 1, 100000);
+    const pages = audiobook
+      ? null
+      : this.integer(count, "pageCount", 1, 100000);
     const work = source.type === "manual" ? null : (b.workId ?? null),
       edition = source.type === "manual" ? null : (b.editionId ?? null),
       isbn = this.isbn(source.type === "manual" ? null : b.isbn);
@@ -1380,8 +1494,9 @@ export class OrganizerEngine {
         href: `/#/bookshelf/${dup.id}`,
       });
     const id = uid("book");
-    const provenance =
-      a.pageCountOverride !== undefined || source.type === "manual"
+    const provenance = audiobook
+      ? "manual"
+      : a.pageCountOverride !== undefined || source.type === "manual"
         ? "manual"
         : (b.pageCountSource ?? "edition");
     if (!["manual", "edition", "work_median"].includes(provenance))
@@ -1404,7 +1519,9 @@ export class OrganizerEngine {
       }
     }
     this.db.run(
-      "INSERT INTO books(id,area_id,title,authors_json,work_id,edition_id,isbn,cover_url,cover_id,page_count,page_count_source,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',?,?)",
+      audiobook
+        ? "INSERT INTO books(id,area_id,title,authors_json,work_id,edition_id,isbn,cover_url,cover_id,page_count,page_count_source,progress_unit,duration_minutes,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?,?,'queued',?,?)"
+        : "INSERT INTO books(id,area_id,title,authors_json,work_id,edition_id,isbn,cover_url,cover_id,page_count,page_count_source,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',?,?)",
       id,
       area,
       title,
@@ -1414,10 +1531,9 @@ export class OrganizerEngine {
       isbn,
       cover,
       b.coverId == null ? null : String(b.coverId),
-      pages,
-      provenance,
-      this.at(),
-      this.at(),
+      ...(audiobook
+        ? [provenance, "time", duration, this.at(), this.at()]
+        : [pages, provenance, this.at(), this.at()]),
     );
     this.itemTouch(this.item(id));
     this.appendQueue(this.item(id));
@@ -1476,7 +1592,11 @@ export class OrganizerEngine {
           ? "archived_at"
           : "done_at";
     this.db.run(
-      `UPDATE ${table} SET state=?,${timeField}=?${item.kind === "book" && state === "done" ? ",current_page=page_count" : ""} WHERE id=?`,
+      `UPDATE ${table} SET state=?,${timeField}=?${
+        item.kind === "book" && state === "done"
+          ? ",current_page=CASE WHEN progress_unit='pages' THEN page_count ELSE current_page END,position_minutes=CASE WHEN progress_unit='time' THEN duration_minutes ELSE position_minutes END"
+          : ""
+      } WHERE id=?`,
       state,
       this.at(),
       item.id,
@@ -1859,7 +1979,11 @@ export class OrganizerEngine {
         }),
       bookPages: s.items
         .filter((i) => i.kind === "book" && i.state === "active")
-        .map((b) => ({ bookId: b.id, currentPage: b.currentPage! })),
+        .map((b) =>
+          b.progressUnit === "time"
+            ? { bookId: b.id, positionMinutes: b.positionMinutes ?? 0 }
+            : { bookId: b.id, currentPage: b.currentPage ?? 0 },
+        ),
       markReadBookIds: [],
       learning: null,
     };
@@ -1909,6 +2033,55 @@ export class OrganizerEngine {
         "Only the currently eligible unsaved review day can be changed.",
       );
     this.need(`review:${date}`);
+  }
+  private canonicalProgress(entry: Row, book: Item) {
+    const hasPage = entry.currentPage !== undefined;
+    const hasClock = entry.position !== undefined;
+    const hasMinutes = entry.positionMinutes !== undefined;
+    if (book.progressUnit === "time") {
+      if (hasPage)
+        this.fail(
+          "VALIDATION_ERROR",
+          "Audiobooks take a listening position in hours and minutes, not a page.",
+          { field: "currentPage" },
+        );
+      if (hasClock && hasMinutes)
+        this.fail(
+          "VALIDATION_ERROR",
+          "Supply position hours and minutes or positionMinutes, not both.",
+          { field: "position" },
+        );
+      if (!hasClock && !hasMinutes)
+        this.fail(
+          "VALIDATION_ERROR",
+          "Audiobook progress needs a position in hours and minutes.",
+          { field: "position" },
+        );
+      const positionMinutes = hasClock
+        ? this.clock(entry.position, "position", 0, book.durationMinutes!)
+        : this.integer(
+            entry.positionMinutes,
+            "positionMinutes",
+            0,
+            book.durationMinutes!,
+          );
+      return { bookId: book.id, positionMinutes };
+    }
+    if (hasClock || hasMinutes)
+      this.fail(
+        "VALIDATION_ERROR",
+        "Page books take currentPage, not a listening position.",
+        { field: "position" },
+      );
+    return {
+      bookId: book.id,
+      currentPage: this.integer(
+        entry.currentPage,
+        "currentPage",
+        0,
+        book.pageCount!,
+      ),
+    };
   }
   private validateDraft(d: any, date: string) {
     if (
@@ -1973,6 +2146,7 @@ export class OrganizerEngine {
       }
     }
     const bookIds = new Set<string>();
+    const normalized = [];
     for (const entry of d.bookPages) {
       const book = this.item(entry.bookId);
       if (
@@ -1982,26 +2156,28 @@ export class OrganizerEngine {
       )
         this.fail(
           "VALIDATION_ERROR",
-          "Page entries must target unique active books.",
+          "Progress entries must target unique active books.",
         );
       bookIds.add(book.id);
-      this.integer(entry.currentPage, "currentPage", 0, book.pageCount!);
+      normalized.push(this.canonicalProgress(entry, book));
     }
+    d.bookPages = normalized;
     if (new Set(d.markReadBookIds).size !== d.markReadBookIds.length)
       this.fail("VALIDATION_ERROR", "Duplicate mark-read choice.");
     for (const id of d.markReadBookIds) {
       const book = this.item(id);
-      const pages =
-        d.bookPages.find((x: any) => x.bookId === id)?.currentPage ??
-        book.currentPage;
-      if (
-        book.kind !== "book" ||
-        book.state !== "active" ||
-        pages !== book.pageCount
-      )
+      const entry = d.bookPages.find((x: any) => x.bookId === id);
+      const atEnd =
+        book.progressUnit === "time"
+          ? (entry?.positionMinutes ?? book.positionMinutes) ===
+            book.durationMinutes
+          : (entry?.currentPage ?? book.currentPage) === book.pageCount;
+      if (book.kind !== "book" || book.state !== "active" || !atEnd)
         this.fail(
           "VALIDATION_ERROR",
-          "Mark as read requires an active book at its last page.",
+          book.progressUnit === "time"
+            ? "Mark as read requires an active audiobook at the end of its length."
+            : "Mark as read requires an active book at its last page.",
         );
     }
     if (d.learning) {
@@ -2155,7 +2331,21 @@ export class OrganizerEngine {
     }
     for (const entry of d.bookPages) {
       const b = this.item(entry.bookId);
-      if (entry.currentPage !== b.currentPage) {
+      if (
+        b.progressUnit === "time" &&
+        entry.positionMinutes !== b.positionMinutes
+      ) {
+        this.db.run(
+          "UPDATE books SET position_minutes=? WHERE id=?",
+          entry.positionMinutes,
+          b.id,
+        );
+        this.itemTouch(b);
+        pages++;
+      } else if (
+        b.progressUnit !== "time" &&
+        entry.currentPage !== b.currentPage
+      ) {
         this.db.run(
           "UPDATE books SET current_page=? WHERE id=?",
           entry.currentPage,
@@ -2226,10 +2416,22 @@ export class OrganizerEngine {
         if (
           !p ||
           Object.keys(p).some(
-            (k) => !["title", "authors", "pageCount"].includes(k),
+            (k) => !["title", "authors", "pageCount", "duration"].includes(k),
           )
         )
           this.fail("VALIDATION_ERROR", "Unknown book patch field.");
+        if (p.pageCount !== undefined && i.progressUnit === "time")
+          this.fail(
+            "VALIDATION_ERROR",
+            "Audiobooks use a duration, not a page count.",
+            { field: "pageCount" },
+          );
+        if (p.duration !== undefined && i.progressUnit !== "time")
+          this.fail(
+            "VALIDATION_ERROR",
+            "Page books use a page count, not a duration.",
+            { field: "duration" },
+          );
         if (p.title !== undefined)
           this.db.run(
             "UPDATE books SET title=? WHERE id=?",
@@ -2251,6 +2453,15 @@ export class OrganizerEngine {
             i.id,
           );
         }
+        if (p.duration !== undefined) {
+          const length = this.clock(p.duration, "duration", 1);
+          this.db.run(
+            "UPDATE books SET duration_minutes=?,position_minutes=MIN(position_minutes,?) WHERE id=?",
+            length,
+            length,
+            i.id,
+          );
+        }
         this.itemTouch(i);
         return { item: this.item(i.id), summary: "Book updated." };
       }
@@ -2260,6 +2471,48 @@ export class OrganizerEngine {
           this.fail("VALIDATION_ERROR", "A book is required.");
         this.active(i);
         this.need(`item:${i.id}`);
+        const hasPage = a.currentPage !== undefined;
+        const hasPosition = a.position !== undefined;
+        if (hasPage === hasPosition)
+          this.fail(
+            "VALIDATION_ERROR",
+            hasPage
+              ? "Set either currentPage or position, not both."
+              : "Set currentPage for a page book or position hours and minutes for an audiobook.",
+          );
+        if (i.progressUnit === "time") {
+          if (hasPage)
+            this.fail(
+              "VALIDATION_ERROR",
+              "This audiobook tracks time. Set position in hours and minutes.",
+              { field: "currentPage" },
+            );
+          const position = this.clock(
+            a.position,
+            "position",
+            0,
+            i.durationMinutes!,
+          );
+          this.db.run(
+            "UPDATE books SET position_minutes=? WHERE id=?",
+            position,
+            i.id,
+          );
+          this.itemTouch(i);
+          const item = this.item(i.id);
+          return {
+            item,
+            canFinish: position === i.durationMinutes,
+            progressPercent: progressPercent(position, i.durationMinutes!),
+            summary: "Listening progress saved.",
+          };
+        }
+        if (hasPosition)
+          this.fail(
+            "VALIDATION_ERROR",
+            "This book tracks pages. Set currentPage.",
+            { field: "position" },
+          );
         const page = this.integer(
           a.currentPage,
           "currentPage",
@@ -2271,6 +2524,7 @@ export class OrganizerEngine {
         return {
           item: this.item(i.id),
           canFinish: page === i.pageCount,
+          progressPercent: progressPercent(page, i.pageCount!),
           summary: "Reading progress saved.",
         };
       }
@@ -2791,9 +3045,7 @@ export class OrganizerEngine {
       );
     });
   }
-  getAccountCredentials(
-    role: CalendarRole,
-  ): {
+  getAccountCredentials(role: CalendarRole): {
     id: string;
     role: CalendarRole;
     email: string;
@@ -3083,9 +3335,7 @@ export class OrganizerEngine {
       )
       .map((r) => this.mapOperation(r));
   }
-  operationPayload(
-    id: string,
-  ): {
+  operationPayload(id: string): {
     operation: Operation;
     action: string;
     payload: Row;

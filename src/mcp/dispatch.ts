@@ -55,6 +55,61 @@ function validateCombination(name: string, args: Record<string, unknown>) {
       "VALIDATION_ERROR",
       "Supply exactly one editionId or ISBN.",
     );
+  if (name === "set_book_progress") {
+    const page = args.currentPage !== undefined;
+    const position = args.position !== undefined;
+    if (page === position)
+      throw new ToolError(
+        "VALIDATION_ERROR",
+        page
+          ? "Set either currentPage or position, not both."
+          : "Set currentPage for a page book or position hours and minutes for an audiobook.",
+      );
+  }
+  if (
+    name === "queue_book" &&
+    object(args.source) &&
+    args.source.type === "manual"
+  ) {
+    const unit = args.source.progressUnit ?? "pages";
+    if (unit === "time") {
+      if (!object(args.source.duration))
+        throw new ToolError(
+          "VALIDATION_ERROR",
+          "Audiobooks require a duration in hours and minutes.",
+        );
+      const duration = args.source.duration;
+      if (
+        typeof duration.hours === "number" &&
+        typeof duration.minutes === "number" &&
+        duration.hours === 0 &&
+        duration.minutes === 0
+      )
+        throw new ToolError(
+          "VALIDATION_ERROR",
+          "Audiobook length must be at least 1 minute.",
+        );
+      if (args.source.pageCount != null || args.pageCountOverride != null)
+        throw new ToolError(
+          "VALIDATION_ERROR",
+          "Audiobooks do not take a page count.",
+        );
+    } else if (unit !== "pages")
+      throw new ToolError(
+        "VALIDATION_ERROR",
+        "progressUnit must be pages or time.",
+      );
+    else if (args.source.pageCount == null)
+      throw new ToolError(
+        "VALIDATION_ERROR",
+        "A positive page count is required.",
+      );
+    else if (args.source.duration != null)
+      throw new ToolError(
+        "VALIDATION_ERROR",
+        "Page books do not take a duration.",
+      );
+  }
   if (name === "list_bookings") {
     const ticket = Boolean(args.ticketId);
     if (

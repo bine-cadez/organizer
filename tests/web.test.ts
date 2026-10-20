@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { formatAudiobookProgress } from "../src/shared/duration";
 import {
   addDays,
   eventsForDay,
+  itemProgress,
   localInstant,
   todayTickets,
 } from "../src/web/api";
-import type { Snapshot } from "../src/shared/types";
+import type { Item, Snapshot } from "../src/shared/types";
 
 describe("browser calendar dates", () => {
   it("uses consecutive Ljubljana midnights across DST", () => {
@@ -50,5 +52,28 @@ describe("browser calendar dates", () => {
     expect(todayTickets(state)).toEqual([]);
     expect(eventsForDay(state, "2026-10-19")).toEqual([]);
     expect(eventsForDay(state, "2026-10-18")).toHaveLength(1);
+  });
+  it("formats audiobook progress as hours and minutes and leaves page labels unchanged", () => {
+    expect(formatAudiobookProgress(5 * 60 + 20, 11 * 60 + 45)).toBe(
+      "5h 20m / 11h 45m (45%)",
+    );
+    const audio = {
+      id: "a",
+      kind: "book",
+      progressUnit: "time",
+      positionMinutes: 320,
+      durationMinutes: 705,
+    } as Item;
+    const pages = {
+      id: "p",
+      kind: "book",
+      progressUnit: "pages",
+      currentPage: 12,
+      pageCount: 240,
+    } as Item;
+    expect(itemProgress({} as Snapshot, audio).label).toBe(
+      "5h 20m / 11h 45m (45%)",
+    );
+    expect(itemProgress({} as Snapshot, pages).label).toBe("p. 12 of 240");
   });
 });

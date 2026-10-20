@@ -1,3 +1,9 @@
+import {
+  formatAudiobookProgress,
+  formatDuration,
+  isAudiobook,
+  splitDuration,
+} from "../shared/duration";
 import type {
   Snapshot,
   Item,
@@ -5,6 +11,8 @@ import type {
   Booking,
   CalendarEvent,
 } from "../shared/types";
+
+export { formatAudiobookProgress, formatDuration, isAudiobook, splitDuration };
 
 export class ApiError extends Error {
   code: string;
@@ -141,6 +149,15 @@ export function currentBooking(
   );
 }
 export function itemProgress(state: Snapshot, item: Item) {
+  if (item.kind === "book" && isAudiobook(item))
+    return {
+      current: item.positionMinutes ?? 0,
+      total: item.durationMinutes ?? 0,
+      label: formatAudiobookProgress(
+        item.positionMinutes ?? 0,
+        item.durationMinutes ?? 0,
+      ),
+    };
   if (item.kind === "book")
     return {
       current: item.currentPage ?? 0,

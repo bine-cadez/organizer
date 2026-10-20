@@ -4,11 +4,13 @@ import { useApp } from "./context";
 import {
   currentBooking,
   dateOf,
+  isAudiobook,
   itemProgress,
   longDate,
   query,
   safe,
   shortDate,
+  splitDuration,
   timeOf,
   todayTickets,
 } from "./api";
@@ -1081,7 +1083,11 @@ export function EditDialog({
   const [title, setTitle] = useState(item.title);
   const [goal, setGoal] = useState(item.goal ?? "");
   const [authors, setAuthors] = useState(item.authors?.join(", ") ?? "");
+  const audio = item.kind === "book" && isAudiobook(item);
+  const initialLength = splitDuration(item.durationMinutes ?? 0);
   const [pages, setPages] = useState(item.pageCount ?? 1);
+  const [hours, setHours] = useState(initialLength.hours);
+  const [minutes, setMinutes] = useState(initialLength.minutes);
   const [error, setError] = useState("");
   return (
     <Modal title={`Edit ${item.kind}`} onClose={onClose}>
@@ -1094,14 +1100,23 @@ export function EditDialog({
               ? { projectId: item.id, patch: { title, goal } }
               : {
                   bookId: item.id,
-                  patch: {
-                    title,
-                    authors: authors
-                      .split(",")
-                      .map((s) => s.trim())
-                      .filter(Boolean),
-                    pageCount: pages,
-                  },
+                  patch: audio
+                    ? {
+                        title,
+                        authors: authors
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                        duration: { hours, minutes },
+                      }
+                    : {
+                        title,
+                        authors: authors
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                        pageCount: pages,
+                      },
                 },
           )
             .then(onClose)
@@ -1128,15 +1143,40 @@ export function EditDialog({
                 onChange={(e) => setAuthors(e.target.value)}
               />
             </Field>
-            <Field label="Page count">
-              <input
-                required
-                type="number"
-                min={1}
-                value={pages}
-                onChange={(e) => setPages(Number(e.target.value))}
-              />
-            </Field>
+            {audio ? (
+              <div className="duration-fields">
+                <Field label="Length hours">
+                  <input
+                    required
+                    type="number"
+                    min={0}
+                    max={999}
+                    value={hours}
+                    onChange={(e) => setHours(Number(e.target.value))}
+                  />
+                </Field>
+                <Field label="Length minutes">
+                  <input
+                    required
+                    type="number"
+                    min={0}
+                    max={59}
+                    value={minutes}
+                    onChange={(e) => setMinutes(Number(e.target.value))}
+                  />
+                </Field>
+              </div>
+            ) : (
+              <Field label="Page count">
+                <input
+                  required
+                  type="number"
+                  min={1}
+                  value={pages}
+                  onChange={(e) => setPages(Number(e.target.value))}
+                />
+              </Field>
+            )}
           </>
         )}
         <ErrorText message={error} />

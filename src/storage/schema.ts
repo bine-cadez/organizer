@@ -1,4 +1,14 @@
-/** Forward-only v1 schema. Each entry is one statement for both DO SQL and SQLite. */
+/** Forward-only schema. Each entry is one statement for both DO SQL and SQLite. */
+export const BOOKS_DDL = `CREATE TABLE IF NOT EXISTS books(id TEXT PRIMARY KEY, area_id TEXT NOT NULL REFERENCES areas(id), title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 120), authors_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(authors_json) AND json_type(authors_json)='array'), work_id TEXT, edition_id TEXT, isbn TEXT, cover_url TEXT, cover_id TEXT, page_count INTEGER, page_count_source TEXT NOT NULL CHECK(page_count_source IN ('edition','work_median','manual')), current_page INTEGER NOT NULL DEFAULT 0, progress_unit TEXT NOT NULL DEFAULT 'pages' CHECK(progress_unit IN ('pages','time')), duration_minutes INTEGER, position_minutes INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL CHECK(state IN ('queued','active','paused','archived','done')), started_at INTEGER, paused_at INTEGER, archived_at INTEGER, done_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1 CHECK(version>0), CHECK((progress_unit='pages' AND page_count IS NOT NULL AND page_count>0 AND page_count<=100000 AND current_page>=0 AND current_page<=page_count AND duration_minutes IS NULL AND position_minutes=0) OR (progress_unit='time' AND page_count IS NULL AND current_page=0 AND duration_minutes IS NOT NULL AND duration_minutes>0 AND duration_minutes<=59999 AND position_minutes>=0 AND position_minutes<=duration_minutes)))`;
+
+export const BOOK_INDEXES = [
+  `CREATE UNIQUE INDEX IF NOT EXISTS one_active_book ON books(area_id) WHERE state='active'`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS unique_book_work ON books(work_id) WHERE work_id IS NOT NULL`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS unique_book_edition ON books(edition_id) WHERE edition_id IS NOT NULL`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS unique_book_isbn ON books(isbn) WHERE isbn IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS books_state ON books(state,area_id)`,
+];
+
 export const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS schema_versions(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1), timezone TEXT NOT NULL CHECK(timezone='Europe/Ljubljana'), setup_skipped INTEGER NOT NULL DEFAULT 0 CHECK(setup_skipped IN (0,1)), created_at INTEGER NOT NULL)`,
@@ -7,12 +17,8 @@ export const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, area_id TEXT NOT NULL REFERENCES areas(id), title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 120), goal TEXT, state TEXT NOT NULL CHECK(state IN ('queued','active','paused','archived','done')), started_at INTEGER, paused_at INTEGER, archived_at INTEGER, done_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1 CHECK(version>0))`,
   `CREATE UNIQUE INDEX IF NOT EXISTS one_active_project ON projects(area_id) WHERE state='active'`,
   `CREATE INDEX IF NOT EXISTS projects_state ON projects(state,area_id)`,
-  `CREATE TABLE IF NOT EXISTS books(id TEXT PRIMARY KEY, area_id TEXT NOT NULL REFERENCES areas(id), title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 120), authors_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(authors_json) AND json_type(authors_json)='array'), work_id TEXT, edition_id TEXT, isbn TEXT, cover_url TEXT, cover_id TEXT, page_count INTEGER NOT NULL CHECK(page_count>0 AND page_count<=100000), page_count_source TEXT NOT NULL CHECK(page_count_source IN ('edition','work_median','manual')), current_page INTEGER NOT NULL DEFAULT 0 CHECK(current_page>=0 AND current_page<=page_count), state TEXT NOT NULL CHECK(state IN ('queued','active','paused','archived','done')), started_at INTEGER, paused_at INTEGER, archived_at INTEGER, done_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1 CHECK(version>0))`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS one_active_book ON books(area_id) WHERE state='active'`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS unique_book_work ON books(work_id) WHERE work_id IS NOT NULL`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS unique_book_edition ON books(edition_id) WHERE edition_id IS NOT NULL`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS unique_book_isbn ON books(isbn) WHERE isbn IS NOT NULL`,
-  `CREATE INDEX IF NOT EXISTS books_state ON books(state,area_id)`,
+  BOOKS_DDL,
+  ...BOOK_INDEXES,
   `CREATE TABLE IF NOT EXISTS queue_entries(id TEXT PRIMARY KEY, area_id TEXT NOT NULL REFERENCES areas(id), position INTEGER NOT NULL, project_id TEXT UNIQUE REFERENCES projects(id), book_id TEXT UNIQUE REFERENCES books(id), CHECK((project_id IS NOT NULL)+(book_id IS NOT NULL)=1), UNIQUE(area_id,position))`,
   `CREATE TABLE IF NOT EXISTS tickets(id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 500), status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo','in_progress','done','closed')), planned_for TEXT, column_position INTEGER NOT NULL DEFAULT 0 CHECK(column_position>=0), current_booking_id TEXT UNIQUE, done_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1 CHECK(version>0), FOREIGN KEY(id,current_booking_id) REFERENCES bookings(ticket_id,id))`,
   `CREATE INDEX IF NOT EXISTS tickets_column ON tickets(project_id,status,column_position,id)`,

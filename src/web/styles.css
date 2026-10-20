@@ -1676,6 +1676,19 @@ hr {
 .book-page-form .button {
   margin-bottom: 2px;
 }
+.book-page-form.duration-form {
+  flex-wrap: wrap;
+}
+.book-page-form.duration-form .field {
+  width: 92px;
+}
+.duration-fields {
+  display: flex;
+  gap: 10px;
+}
+.duration-fields .field {
+  width: 120px;
+}
 .book-detail > .learnings {
   padding: 0;
   border: 0;
@@ -2237,6 +2250,17 @@ hr {
   width: 80px;
   text-align: right;
   font-size: 18px;
+}
+.review-page.review-time {
+  flex-wrap: wrap;
+}
+.review-page.review-time input {
+  width: 64px;
+}
+.review-page.review-time label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
 }
 .learning-targets {
   display: flex;

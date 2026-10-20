@@ -1,6 +1,14 @@
 import { useEffect, useState, type FormEvent } from "react";
 import type { BookCandidate, Item } from "../shared/types";
-import { ApiError, request, safe } from "./api";
+import {
+  ApiError,
+  formatAudiobookProgress,
+  formatDuration,
+  isAudiobook,
+  request,
+  safe,
+  splitDuration,
+} from "./api";
 import { useApp } from "./context";
 import {
   areaNames,
@@ -84,8 +92,16 @@ export function Bookshelf({ selectedId }: { selectedId?: string }) {
                   <Cover item={book} />
                   {book.state === "active" && (
                     <Progress
-                      current={book.currentPage ?? 0}
-                      total={book.pageCount ?? 1}
+                      current={
+                        isAudiobook(book)
+                          ? (book.positionMinutes ?? 0)
+                          : (book.currentPage ?? 0)
+                      }
+                      total={
+                        isAudiobook(book)
+                          ? (book.durationMinutes ?? 1)
+                          : (book.pageCount ?? 1)
+                      }
                     />
                   )}
                   <strong>{book.title}</strong>
@@ -95,7 +111,12 @@ export function Bookshelf({ selectedId }: { selectedId?: string }) {
                   <small>
                     <Tile area={book.areaId} />
                     {book.state === "active"
-                      ? `p. ${book.currentPage ?? 0} / ${book.pageCount}`
+                      ? isAudiobook(book)
+                        ? formatAudiobookProgress(
+                            book.positionMinutes ?? 0,
+                            book.durationMinutes ?? 0,
+                          )
+                        : `p. ${book.currentPage ?? 0} / ${book.pageCount}`
                       : book.state === "queued"
                         ? "Want to read"
                         : book.state === "done"
@@ -144,8 +165,22 @@ export function Bookshelf({ selectedId }: { selectedId?: string }) {
 }
 function BookDetail({ item, onClose }: { item: Item; onClose: () => void }) {
   const { state, command, start, busy } = useApp();
+  const audio = isAudiobook(item);
   const [page, setPage] = useState(item.currentPage ?? 0);
-  useEffect(() => setPage(item.currentPage ?? 0), [item.currentPage]);
+  const [hours, setHours] = useState(
+    () => splitDuration(item.positionMinutes ?? 0).hours,
+  );
+  const [minutes, setMinutes] = useState(
+    () => splitDuration(item.positionMinutes ?? 0).minutes,
+  );
+  const [progressError, setProgressError] = useState("");
+  useEffect(() => setPage(item.currentPage ?? 0), [item.currentPage, item.id]);
+  useEffect(() => {
+    const parts = splitDuration(item.positionMinutes ?? 0);
+    setHours(parts.hours);
+    setMinutes(parts.minutes);
+    setProgressError("");
+  }, [item.positionMinutes, item.id]);
   const holder = state.items.find(
     (i) =>
       i.state === "active" &&
@@ -160,7 +195,10 @@ function BookDetail({ item, onClose }: { item: Item; onClose: () => void }) {
         <div>
           <h2>{item.title}</h2>
           <p>
-            {item.authors?.join(", ")} · {item.pageCount} pages
+            {item.authors?.join(", ")}
+            {audio
+              ? ` · Audiobook · ${formatDuration(item.durationMinutes ?? 0)}`
+              : ` · ${item.pageCount} pages`}
           </p>
           <p>
             <Tile area={item.areaId} />
@@ -179,47 +217,118 @@ function BookDetail({ item, onClose }: { item: Item; onClose: () => void }) {
         <>
           <div className="book-progress-line">
             <strong>
-              Page {item.currentPage ?? 0} of {item.pageCount}
+              {audio
+                ? formatAudiobookProgress(
+                    item.positionMinutes ?? 0,
+                    item.durationMinutes ?? 0,
+                  )
+                : `Page ${item.currentPage ?? 0} of ${item.pageCount}`}
             </strong>
-            <span>
-              {Math.round(
-                ((item.currentPage ?? 0) / (item.pageCount || 1)) * 100,
-              )}
-              %
-            </span>
+            {!audio && (
+              <span>
+                {Math.round(
+                  ((item.currentPage ?? 0) / (item.pageCount || 1)) * 100,
+                )}
+                %
+              </span>
+            )}
           </div>
           <Progress
-            current={item.currentPage ?? 0}
-            total={item.pageCount ?? 1}
+            current={
+              audio ? (item.positionMinutes ?? 0) : (item.currentPage ?? 0)
+            }
+            total={audio ? (item.durationMinutes ?? 1) : (item.pageCount ?? 1)}
           />
-          <form
-            className="book-page-form"
-            onSubmit={(e) => {
-              e.preventDefault();
-              safe(
+          {audio ? (
+            <form
+              className="book-page-form duration-form"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (
+                  !Number.isInteger(hours) ||
+                  !Number.isInteger(minutes) ||
+                  hours < 0 ||
+                  minutes < 0 ||
+                  minutes > 59
+                ) {
+                  setProgressError("Use whole hours and 0–59 minutes.");
+                  return;
+                }
+                const position = hours * 60 + minutes;
+                if (position > (item.durationMinutes ?? 0)) {
+                  setProgressError(
+                    "That position is past the end of the audiobook.",
+                  );
+                  return;
+                }
+                setProgressError("");
                 command("set_book_progress", {
                   bookId: item.id,
-                  currentPage: page,
-                }),
-              );
-            }}
-          >
-            <Field label="Current page">
-              <input
-                type="number"
-                inputMode="numeric"
-                min={0}
-                max={item.pageCount}
-                required
-                value={page}
-                onChange={(e) => setPage(Number(e.target.value))}
-              />
-            </Field>
-            <Button small disabled={busy}>
-              Update page
-            </Button>
-          </form>
-          {item.currentPage === item.pageCount && (
+                  position: { hours, minutes },
+                }).catch((error: Error) => setProgressError(error.message));
+              }}
+            >
+              <Field label="Hours">
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min={0}
+                  max={999}
+                  required
+                  aria-label="Current hours"
+                  value={hours}
+                  onChange={(e) => setHours(Number(e.target.value))}
+                />
+              </Field>
+              <Field label="Minutes">
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min={0}
+                  max={59}
+                  required
+                  aria-label="Current minutes"
+                  value={minutes}
+                  onChange={(e) => setMinutes(Number(e.target.value))}
+                />
+              </Field>
+              <Button small disabled={busy}>
+                Update position
+              </Button>
+            </form>
+          ) : (
+            <form
+              className="book-page-form"
+              onSubmit={(e) => {
+                e.preventDefault();
+                safe(
+                  command("set_book_progress", {
+                    bookId: item.id,
+                    currentPage: page,
+                  }),
+                );
+              }}
+            >
+              <Field label="Current page">
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min={0}
+                  max={item.pageCount}
+                  required
+                  value={page}
+                  onChange={(e) => setPage(Number(e.target.value))}
+                />
+              </Field>
+              <Button small disabled={busy}>
+                Update page
+              </Button>
+            </form>
+          )}
+          {progressError && <ErrorText message={progressError} />}
+          {(audio
+            ? item.positionMinutes === item.durationMinutes
+            : item.currentPage === item.pageCount) && (
             <Button
               primary
               onClick={() => safe(command("finish_item", { itemId: item.id }))}
@@ -235,21 +344,25 @@ function BookDetail({ item, onClose }: { item: Item; onClose: () => void }) {
           <Button className="open-place-button" onClick={() => start(item)}>
             {holder
               ? `Book place reserved for “${holder.title}”`
-              : "Start reading, place is open"}
+              : audio
+                ? "Start listening, place is open"
+                : "Start reading, place is open"}
           </Button>
         </>
       )}
       {item.state === "paused" && (
         <>
           <p>
-            Paused · p. {item.currentPage ?? 0} of {item.pageCount}
+            {audio
+              ? `Paused · ${formatAudiobookProgress(item.positionMinutes ?? 0, item.durationMinutes ?? 0)}`
+              : `Paused · p. ${item.currentPage ?? 0} of ${item.pageCount}`}
           </p>
           <Button
             small
             disabled={Boolean(holder)}
             onClick={() => safe(command("resume_item", { itemId: item.id }))}
           >
-            Resume reading
+            {audio ? "Resume listening" : "Resume reading"}
           </Button>
           {holder && (
             <p className="muted">Book place reserved for “{holder.title}”</p>
@@ -300,6 +413,9 @@ export function FindBook({
   const [manual, setManual] = useState(false);
   const [selected, setSelected] = useState<BookCandidate>();
   const [pageCount, setPageCount] = useState("");
+  const [format, setFormat] = useState<"pages" | "time">("pages");
+  const [hours, setHours] = useState("");
+  const [minutes, setMinutes] = useState("");
   const [title, setTitle] = useState("");
   const [authors, setAuthors] = useState("");
   useEffect(() => {
@@ -336,7 +452,11 @@ export function FindBook({
       controller.abort();
     };
   }, [search]);
-  async function add(candidate?: BookCandidate, count?: number) {
+  async function add(
+    candidate?: BookCandidate,
+    count?: number,
+    duration?: { hours: number; minutes: number },
+  ) {
     setError("");
     try {
       const before = new Set(state.items.map((i) => i.id));
@@ -346,15 +466,26 @@ export function FindBook({
           areaId: area,
           source: candidate
             ? { type: "open_library", editionId: candidate.editionId }
-            : {
-                type: "manual",
-                title,
-                authors: authors
-                  .split(",")
-                  .map((s) => s.trim())
-                  .filter(Boolean),
-                pageCount: count,
-              },
+            : duration
+              ? {
+                  type: "manual",
+                  title,
+                  authors: authors
+                    .split(",")
+                    .map((s) => s.trim())
+                    .filter(Boolean),
+                  progressUnit: "time",
+                  duration,
+                }
+              : {
+                  type: "manual",
+                  title,
+                  authors: authors
+                    .split(",")
+                    .map((s) => s.trim())
+                    .filter(Boolean),
+                  pageCount: count,
+                },
           ...(candidate && count ? { pageCountOverride: count } : {}),
         },
         !start,
@@ -408,9 +539,46 @@ export function FindBook({
         <form
           onSubmit={(e) => {
             e.preventDefault();
+            if (format === "time") {
+              const lengthHours = Number(hours);
+              const lengthMinutes = Number(minutes);
+              if (
+                !Number.isInteger(lengthHours) ||
+                !Number.isInteger(lengthMinutes) ||
+                lengthHours < 0 ||
+                lengthHours > 999 ||
+                lengthMinutes < 0 ||
+                lengthMinutes > 59 ||
+                (lengthHours === 0 && lengthMinutes === 0)
+              ) {
+                setError(
+                  "Enter a length of at least 1 minute. Minutes must be 0–59.",
+                );
+                return;
+              }
+              safe(
+                add(undefined, undefined, {
+                  hours: lengthHours,
+                  minutes: lengthMinutes,
+                }),
+              );
+              return;
+            }
             safe(add(undefined, Number(pageCount)));
           }}
         >
+          <Segment
+            label="Book format"
+            value={format}
+            onChange={(value) => {
+              setFormat(value as "pages" | "time");
+              setError("");
+            }}
+            values={[
+              { id: "pages", label: "Book" },
+              { id: "time", label: "Audiobook" },
+            ]}
+          />
           <Field label="Title">
             <input
               autoFocus
@@ -426,18 +594,49 @@ export function FindBook({
               onChange={(e) => setAuthors(e.target.value)}
             />
           </Field>
-          <Field label="How many pages?">
-            <input
-              type="number"
-              required
-              min={1}
-              inputMode="numeric"
-              value={pageCount}
-              onChange={(e) => setPageCount(e.target.value)}
-            />
-          </Field>
+          {format === "time" ? (
+            <div className="duration-fields">
+              <Field label="Hours">
+                <input
+                  type="number"
+                  required
+                  min={0}
+                  max={999}
+                  inputMode="numeric"
+                  aria-label="Length hours"
+                  value={hours}
+                  onChange={(e) => setHours(e.target.value)}
+                />
+              </Field>
+              <Field label="Minutes">
+                <input
+                  type="number"
+                  required
+                  min={0}
+                  max={59}
+                  inputMode="numeric"
+                  aria-label="Length minutes"
+                  value={minutes}
+                  onChange={(e) => setMinutes(e.target.value)}
+                />
+              </Field>
+            </div>
+          ) : (
+            <Field label="How many pages?">
+              <input
+                type="number"
+                required
+                min={1}
+                inputMode="numeric"
+                value={pageCount}
+                onChange={(e) => setPageCount(e.target.value)}
+              />
+            </Field>
+          )}
           <p className="muted">
-            We'll use a title card. You can track reading progress as usual.
+            {format === "time"
+              ? "We'll use a title card. You'll track listening progress in hours and minutes."
+              : "We'll use a title card. You can track reading progress as usual."}
           </p>
           <ErrorText message={error} />
           <div className="form-actions">
