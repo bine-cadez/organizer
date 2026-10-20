@@ -674,6 +674,146 @@ describe("persisted Organizer domain", () => {
     ).toThrow("final");
   });
 
+  it("tracks audiobook progress in hours and minutes and leaves page books unchanged", () => {
+    const f = fixture();
+    const pages = f.apply("queue_book", {
+      areaId: "tech",
+      source: {
+        type: "manual",
+        title: "Paper",
+        authors: ["Author"],
+        pageCount: 100,
+      },
+    }).data.item;
+    expect(pages.progressUnit).toBe("pages");
+    expect(pages.durationMinutes).toBeUndefined();
+    expect(pages.currentPage).toBe(0);
+    f.apply("start_item", { itemId: pages.id });
+    const audio = f.apply("queue_book", {
+      areaId: "self",
+      source: {
+        type: "manual",
+        title: "The audiobook",
+        authors: ["Narrator"],
+        progressUnit: "time",
+        duration: { hours: 11, minutes: 45 },
+      },
+    }).data.item;
+    expect(audio.progressUnit).toBe("time");
+    expect(audio.durationMinutes).toBe(11 * 60 + 45);
+    expect(audio.positionMinutes).toBe(0);
+    expect(audio.pageCount).toBeUndefined();
+    expect(audio.currentPage).toBeUndefined();
+    f.apply("start_item", { itemId: audio.id });
+    const saved = f.apply("set_book_progress", {
+      bookId: audio.id,
+      position: { hours: 5, minutes: 20 },
+    });
+    expect(saved.data.item.positionMinutes).toBe(5 * 60 + 20);
+    expect(saved.data.progressPercent).toBe(45);
+    expect(saved.data.canFinish).toBe(false);
+    expect(saved.data.summary).toBe("Listening progress saved.");
+    expect(() =>
+      f.apply("set_book_progress", { bookId: audio.id, currentPage: 10 }),
+    ).toThrow(/hours and minutes/);
+    expect(() =>
+      f.apply("set_book_progress", {
+        bookId: pages.id,
+        position: { hours: 1, minutes: 0 },
+      }),
+    ).toThrow(/currentPage/);
+    expect(() =>
+      f.apply("set_book_progress", {
+        bookId: audio.id,
+        position: { hours: 5, minutes: 20 },
+        currentPage: 1,
+      }),
+    ).toThrow(/not both/);
+    expect(() =>
+      f.apply("set_book_progress", {
+        bookId: audio.id,
+        position: { hours: 12, minutes: 0 },
+      }),
+    ).toThrow(/within the audiobook/);
+    expect(() =>
+      f.apply("set_book_progress", {
+        bookId: audio.id,
+        position: { hours: 1, minutes: 60 },
+      }),
+    ).toThrow(/minutes/);
+    expect(() =>
+      f.apply("queue_book", {
+        areaId: "sales",
+        source: {
+          type: "manual",
+          title: "Empty",
+          authors: [],
+          progressUnit: "time",
+          duration: { hours: 0, minutes: 0 },
+        },
+      }),
+    ).toThrow(/at least 1 minute/);
+    f.apply("update_book", {
+      bookId: audio.id,
+      patch: { duration: { hours: 5, minutes: 0 } },
+    });
+    expect(
+      f.engine.snapshot().items.find((item) => item.id === audio.id)
+        ?.positionMinutes,
+    ).toBe(5 * 60);
+    expect(
+      f.engine.snapshot().items.find((item) => item.id === audio.id)
+        ?.durationMinutes,
+    ).toBe(5 * 60);
+    expect(() =>
+      f.apply("update_book", { bookId: audio.id, patch: { pageCount: 10 } }),
+    ).toThrow(/duration, not a page count/);
+    expect(() =>
+      f.apply("update_book", {
+        bookId: pages.id,
+        patch: { duration: { hours: 1, minutes: 0 } },
+      }),
+    ).toThrow(/page count, not a duration/);
+    const done = f.apply("set_book_progress", {
+      bookId: audio.id,
+      position: { hours: 5, minutes: 0 },
+    });
+    expect(done.data.canFinish).toBe(true);
+    expect(done.data.progressPercent).toBe(100);
+    expect(() =>
+      f.apply("update_review_draft", {
+        date: "2026-10-18",
+        patch: {
+          bookPages: [
+            { bookId: audio.id, position: { hours: 4, minutes: 30 } },
+          ],
+          markReadBookIds: [audio.id],
+        },
+      }),
+    ).toThrow(/end of its length/);
+    f.apply("update_review_draft", {
+      date: "2026-10-18",
+      patch: {
+        bookPages: [{ bookId: audio.id, positionMinutes: 5 * 60 }],
+        markReadBookIds: [audio.id],
+      },
+    });
+    f.apply("save_review", { date: "2026-10-18" });
+    const finished = f.engine
+      .snapshot()
+      .items.find((item) => item.id === audio.id);
+    expect(finished?.state).toBe("done");
+    expect(finished?.positionMinutes).toBe(5 * 60);
+    expect(finished?.durationMinutes).toBe(5 * 60);
+    f.apply("finish_item", { itemId: pages.id });
+    const paper = f.engine
+      .snapshot()
+      .items.find((item) => item.id === pages.id);
+    expect(paper?.state).toBe("done");
+    expect(paper?.currentPage).toBe(100);
+    expect(paper?.progressUnit).toBe("pages");
+  });
+
   it("fits free starts to requested length and guards overlap/bounds", () => {
     const f = fixture();
     f.calendar();

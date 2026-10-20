@@ -4,10 +4,14 @@ import {
   addDays,
   currentBooking,
   eventsForDay,
+  formatAudiobookProgress,
+  formatDuration,
+  isAudiobook,
   localInstant,
   query,
   safe,
   shortDate,
+  splitDuration,
   timeOf,
   todayTickets,
 } from "./api";
@@ -51,10 +55,11 @@ export function ReviewScreen() {
             ticketId: t.id,
             destination: { kind: "tomorrow_unbooked" },
           })),
-        bookPages: activeBooks.map((b) => ({
-          bookId: b.id,
-          currentPage: b.currentPage ?? 0,
-        })),
+        bookPages: activeBooks.map((b) =>
+          isAudiobook(b)
+            ? { bookId: b.id, positionMinutes: b.positionMinutes ?? 0 }
+            : { bookId: b.id, currentPage: b.currentPage ?? 0 },
+        ),
         markReadBookIds: [],
         learning: null,
       },
@@ -378,18 +383,46 @@ export function ReviewScreen() {
         )}
         {step === 2 && (
           <>
-            <h2>Which page are you on?</h2>
+            <h2>
+              {activeBooks.some(isAudiobook)
+                ? "Where did you get to?"
+                : "Which page are you on?"}
+            </h2>
             <p className="review-lead">
-              Only your active books. Leave it unchanged if you didn't read
-              today.
+              {activeBooks.some(isAudiobook)
+                ? "Only your active books. Leave a page or listening position unchanged if you didn't get further today."
+                : "Only your active books. Leave it unchanged if you didn't read today."}
             </p>
             {activeBooks.length ? (
               activeBooks.map((book) => {
+                const audio = isAudiobook(book);
                 const page =
                   draft.bookPages.find((p) => p.bookId === book.id)
                     ?.currentPage ??
                   book.currentPage ??
                   0;
+                const position =
+                  draft.bookPages.find((p) => p.bookId === book.id)
+                    ?.positionMinutes ??
+                  book.positionMinutes ??
+                  0;
+                const parts = splitDuration(position);
+                const atEnd = audio
+                  ? position === book.durationMinutes
+                  : page === book.pageCount;
+                const setPosition = (next: number) => {
+                  if (next < 0 || next > (book.durationMinutes ?? 0)) return;
+                  update({
+                    bookPages: [
+                      ...draft.bookPages.filter((p) => p.bookId !== book.id),
+                      { bookId: book.id, positionMinutes: next },
+                    ],
+                    markReadBookIds:
+                      next === book.durationMinutes
+                        ? draft.markReadBookIds
+                        : draft.markReadBookIds.filter((id) => id !== book.id),
+                  });
+                };
                 return (
                   <div className="review-book" key={book.id}>
                     <Cover item={book} />
@@ -399,8 +432,20 @@ export function ReviewScreen() {
                         {book.authors?.join(", ")} ·{" "}
                         {state.areas.find((a) => a.id === book.areaId)?.name}
                       </small>
-                      <small>Yesterday: p. {book.currentPage ?? 0}</small>
-                      {page === book.pageCount && (
+                      <small>
+                        {audio
+                          ? `Yesterday: ${formatDuration(book.positionMinutes ?? 0)}`
+                          : `Yesterday: p. ${book.currentPage ?? 0}`}
+                      </small>
+                      {audio && (
+                        <small>
+                          {formatAudiobookProgress(
+                            position,
+                            book.durationMinutes ?? 0,
+                          )}
+                        </small>
+                      )}
+                      {atEnd && (
                         <label className="checkbox-label">
                           <input
                             type="checkbox"
@@ -419,35 +464,75 @@ export function ReviewScreen() {
                         </label>
                       )}
                     </div>
-                    <label className="review-page">
-                      p.{" "}
-                      <input
-                        aria-label={`Current page for ${book.title}`}
-                        type="number"
-                        inputMode="numeric"
-                        min={0}
-                        max={book.pageCount}
-                        value={page}
-                        onChange={(e) => {
-                          const currentPage = Number(e.target.value);
-                          update({
-                            bookPages: [
-                              ...draft.bookPages.filter(
-                                (p) => p.bookId !== book.id,
-                              ),
-                              { bookId: book.id, currentPage },
-                            ],
-                            markReadBookIds:
-                              currentPage === book.pageCount
-                                ? draft.markReadBookIds
-                                : draft.markReadBookIds.filter(
-                                    (id) => id !== book.id,
-                                  ),
-                          });
-                        }}
-                      />{" "}
-                      / {book.pageCount}
-                    </label>
+                    {audio ? (
+                      <div className="review-page review-time">
+                        <label>
+                          h{" "}
+                          <input
+                            aria-label={`Current hours for ${book.title}`}
+                            type="number"
+                            inputMode="numeric"
+                            min={0}
+                            max={999}
+                            value={parts.hours}
+                            onChange={(e) =>
+                              setPosition(
+                                Number(e.target.value) * 60 + parts.minutes,
+                              )
+                            }
+                          />
+                        </label>
+                        <label>
+                          m{" "}
+                          <input
+                            aria-label={`Current minutes for ${book.title}`}
+                            type="number"
+                            inputMode="numeric"
+                            min={0}
+                            max={59}
+                            value={parts.minutes}
+                            onChange={(e) => {
+                              const nextMinutes = Number(e.target.value);
+                              if (nextMinutes > 59) return;
+                              setPosition(parts.hours * 60 + nextMinutes);
+                            }}
+                          />
+                        </label>
+                        <span>
+                          / {formatDuration(book.durationMinutes ?? 0)}
+                        </span>
+                      </div>
+                    ) : (
+                      <label className="review-page">
+                        p.{" "}
+                        <input
+                          aria-label={`Current page for ${book.title}`}
+                          type="number"
+                          inputMode="numeric"
+                          min={0}
+                          max={book.pageCount}
+                          value={page}
+                          onChange={(e) => {
+                            const currentPage = Number(e.target.value);
+                            update({
+                              bookPages: [
+                                ...draft.bookPages.filter(
+                                  (p) => p.bookId !== book.id,
+                                ),
+                                { bookId: book.id, currentPage },
+                              ],
+                              markReadBookIds:
+                                currentPage === book.pageCount
+                                  ? draft.markReadBookIds
+                                  : draft.markReadBookIds.filter(
+                                      (id) => id !== book.id,
+                                    ),
+                            });
+                          }}
+                        />{" "}
+                        / {book.pageCount}
+                      </label>
+                    )}
                   </div>
                 );
               })

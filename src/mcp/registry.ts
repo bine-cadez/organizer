@@ -35,6 +35,16 @@ const state = z.enum(["queued", "active", "paused", "archived", "done"]);
 const status = z.enum(["todo", "in_progress", "done", "closed"]);
 const role = z.enum(["personal", "work"]);
 const pageCount = z.number().int().positive().max(100000);
+const clock = z
+  .object({
+    hours: z.number().int().min(0).max(999),
+    minutes: z.number().int().min(0).max(59),
+  })
+  .strict();
+const positiveDuration = clock.refine(
+  (value) => value.hours > 0 || value.minutes > 0,
+  "Duration must be at least 1 minute.",
+);
 const author = z.string().trim().min(1).max(200);
 const editionId = z.string().regex(/^\/books\/OL\d+M$/);
 const isbn = z
@@ -148,7 +158,9 @@ const draftPatch = z
         z
           .object({
             bookId: id,
-            currentPage: z.number().int().min(0).max(100000),
+            currentPage: z.number().int().min(0).max(100000).optional(),
+            positionMinutes: z.number().int().min(0).max(59999).optional(),
+            position: clock.optional(),
           })
           .strict(),
       )
@@ -356,17 +368,27 @@ export const toolDefinitions: readonly ToolDefinition[] = [
   ),
   mutation(
     "queue_book",
-    "Import a verified Open Library edition or manual book into Up next; automatic cover or title card, no upload. Requires queue revision.",
+    "Import a verified Open Library edition or manual book into Up next; automatic cover or title card, no upload. Manual audiobooks take progressUnit time and a duration in hours and minutes. Requires queue revision.",
     {
       areaId: area,
-      source: z.discriminatedUnion("type", [
+      source: z.union([
         z.object({ type: z.literal("open_library"), editionId }).strict(),
         z
           .object({
             type: z.literal("manual"),
             title,
             authors: z.array(author).max(20),
+            progressUnit: z.literal("pages").optional(),
             pageCount,
+          })
+          .strict(),
+        z
+          .object({
+            type: z.literal("manual"),
+            title,
+            authors: z.array(author).max(20),
+            progressUnit: z.literal("time"),
+            duration: positiveDuration,
           })
           .strict(),
       ]),
@@ -378,7 +400,7 @@ export const toolDefinitions: readonly ToolDefinition[] = [
   ),
   mutation(
     "update_book",
-    "Edit book metadata; lowering page count clamps current page atomically.",
+    "Edit book metadata. Lowering page count clamps the current page. Lowering an audiobook's duration clamps the listening position. Page count and duration apply only to the matching progress unit.",
     {
       bookId: id,
       patch: z
@@ -386,6 +408,7 @@ export const toolDefinitions: readonly ToolDefinition[] = [
           title: title.optional(),
           authors: z.array(author).max(20).optional(),
           pageCount: pageCount.optional(),
+          duration: positiveDuration.optional(),
         })
         .strict()
         .refine(
@@ -397,8 +420,12 @@ export const toolDefinitions: readonly ToolDefinition[] = [
   ),
   mutation(
     "set_book_progress",
-    "Set active book page within 0..pageCount; final page offers finishing, never auto-finishes.",
-    { bookId: id, currentPage: z.number().int().min(0).max(100000) },
+    "Set an active book's progress. Page books take currentPage within 0..pageCount. Audiobooks take position hours and minutes within the stored length. Reaching the end offers finishing and never auto-finishes.",
+    {
+      bookId: id,
+      currentPage: z.number().int().min(0).max(100000).optional(),
+      position: clock.optional(),
+    },
     "organizer:write",
   ),
   read(

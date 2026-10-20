@@ -86,9 +86,13 @@ export function readDomain(database) {
       rows: values.map((row) => columns.map((column) => row[column])),
     };
   });
-  assert.equal(
-    tables.find((table) => table.name === "schema_versions").rows.at(-1)?.[0],
-    1,
+  const versions = tables
+    .find((table) => table.name === "schema_versions")
+    .rows.map((row) => row[0]);
+  assert.ok(
+    versions.length > 0 &&
+      versions.every((version) => version === 1 || version === 2) &&
+      Math.max(...versions) <= 2,
     "Unsupported database version.",
   );
   return {

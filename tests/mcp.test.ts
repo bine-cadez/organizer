@@ -179,6 +179,122 @@ describe("MCP contract boundary", () => {
     ).toBe("VALIDATION_ERROR");
   });
 
+  it("accepts audiobook duration on queue and position on progress, and keeps page calls valid", async () => {
+    const ctx = context();
+    const queued = await executeTool(
+      "queue_book",
+      {
+        areaId: "self",
+        source: {
+          type: "manual",
+          title: "The audiobook",
+          authors: ["Narrator"],
+          progressUnit: "time",
+          duration: { hours: 11, minutes: 45 },
+        },
+        ...envelope,
+      },
+      ctx,
+    );
+    expect(queued.isError).toBeUndefined();
+    expect(ctx.execute).toHaveBeenCalledWith(
+      "queue_book",
+      expect.objectContaining({
+        source: expect.objectContaining({
+          progressUnit: "time",
+          duration: { hours: 11, minutes: 45 },
+        }),
+      }),
+    );
+    const moved = await executeTool(
+      "set_book_progress",
+      {
+        bookId: "book_1",
+        position: { hours: 5, minutes: 20 },
+        ...envelope,
+      },
+      ctx,
+    );
+    expect(moved.isError).toBeUndefined();
+    const legacy = await executeTool(
+      "set_book_progress",
+      { bookId: "book_1", currentPage: 40, ...envelope },
+      ctx,
+    );
+    expect(legacy.isError).toBeUndefined();
+    expect(
+      errorCode(
+        await executeTool(
+          "set_book_progress",
+          {
+            bookId: "book_1",
+            currentPage: 1,
+            position: { hours: 1, minutes: 0 },
+            ...envelope,
+          },
+          ctx,
+        ),
+      ),
+    ).toBe("VALIDATION_ERROR");
+    expect(
+      errorCode(
+        await executeTool(
+          "set_book_progress",
+          { bookId: "book_1", ...envelope },
+          ctx,
+        ),
+      ),
+    ).toBe("VALIDATION_ERROR");
+    expect(
+      errorCode(
+        await executeTool(
+          "set_book_progress",
+          {
+            bookId: "book_1",
+            position: { hours: 1, minutes: 60 },
+            ...envelope,
+          },
+          ctx,
+        ),
+      ),
+    ).toBe("VALIDATION_ERROR");
+    expect(
+      errorCode(
+        await executeTool(
+          "queue_book",
+          {
+            areaId: "self",
+            source: {
+              type: "manual",
+              title: "Too short",
+              authors: [],
+              progressUnit: "time",
+              duration: { hours: 0, minutes: 0 },
+            },
+            ...envelope,
+          },
+          ctx,
+        ),
+      ),
+    ).toBe("VALIDATION_ERROR");
+    const edited = await executeTool(
+      "update_book",
+      {
+        bookId: "book_1",
+        patch: { duration: { hours: 2, minutes: 5 } },
+        ...envelope,
+      },
+      ctx,
+    );
+    expect(edited.isError).toBeUndefined();
+    expect(ctx.execute).toHaveBeenCalledWith(
+      "update_book",
+      expect.objectContaining({
+        patch: { duration: { hours: 2, minutes: 5 } },
+      }),
+    );
+  });
+
   it("replays a committed book import without relying on Open Library availability", async () => {
     const ctx = context(ALL_SCOPES, { outcome: "applied", deduplicated: true });
     vi.mocked(ctx.getBookCandidate).mockRejectedValue(

@@ -30,7 +30,7 @@ export const promptDefinitions = [
       "Stage and save the eligible unsaved four-step evening review.",
     argsSchema: {},
     instruction:
-      "Read get_review for its eligible day. Guide Tick off, Slipped, Book pages and What I learned. Keep scheduling selections inside update_review_draft; never call book_ticket to implement a draft choice. Inspect/save when instructed, then treat the saved review as final. Another learning can use add_learning on an active parent; never reopen a saved review.",
+      "Read get_review for its eligible day. Guide Tick off, Slipped, Book pages or audiobook position, and What I learned. Keep scheduling selections inside update_review_draft; never call book_ticket to implement a draft choice. Inspect/save when instructed, then treat the saved review as final. Another learning can use add_learning on an active parent; never reopen a saved review.",
   },
   {
     name: "choose_next_item",

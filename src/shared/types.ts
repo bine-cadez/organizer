@@ -1,6 +1,7 @@
 export type AreaId = "tech" | "sales" | "ship" | "self";
 export type ItemKind = "project" | "book";
 export type ItemState = "queued" | "active" | "paused" | "archived" | "done";
+export type ProgressUnit = "pages" | "time";
 export type TicketStatus = "todo" | "in_progress" | "done" | "closed";
 export type CalendarRole = "personal" | "work";
 export interface Actor {
@@ -23,9 +24,15 @@ export interface Item {
   version: string;
   goal?: string;
   authors?: string[];
+  /** Pages for print books. Audiobooks use durationMinutes instead. */
+  progressUnit?: ProgressUnit;
   pageCount?: number;
   pageCountSource?: string;
   currentPage?: number;
+  /** Total audiobook length in minutes. */
+  durationMinutes?: number;
+  /** Current audiobook position in minutes. */
+  positionMinutes?: number;
   coverUrl?: string;
   workId?: string;
   editionId?: string;
@@ -124,7 +131,11 @@ export type SlippedDestination =
 export interface ReviewDraft {
   completedTicketIds: string[];
   slippedDestinations: { ticketId: string; destination: SlippedDestination }[];
-  bookPages: { bookId: string; currentPage: number }[];
+  bookPages: {
+    bookId: string;
+    currentPage?: number;
+    positionMinutes?: number;
+  }[];
   markReadBookIds: string[];
   learning: null | { text: string; target: { kind: ItemKind; id: string } };
 }

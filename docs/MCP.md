@@ -174,7 +174,7 @@ There are 47 tools in this contract. Scope cells list additional scopes beyond t
 | `update_project` | `organizer:write` | `{ projectId, patch: { title?, goal?: string \| null } }` | Updated editable metadata; cannot change area, state or place by patch |
 | `start_item` | `lifecycle:write` | `{ itemId }` | Queued item becomes active only if its matching place is Open; otherwise `PLACE_RESERVED` |
 | `pause_item` | `lifecycle:write` | `{ itemId }` | Active → paused; opens place; in-progress tickets → To do; future booking deletions staged |
-| `finish_item` | `lifecycle:write` | `{ itemId }` | Active → done; project open tickets → closed with future deletions; book reaches page count; opens place |
+| `finish_item` | `lifecycle:write` | `{ itemId }` | Active → done; project open tickets → closed with future deletions; page book reaches page count, audiobook reaches the end of its length; opens place |
 | `archive_item` | `lifecycle:write` | `{ itemId }` | Active → archived, opens place, stages future booking deletions; read-only afterward |
 | `resume_item` | `lifecycle:write` | `{ itemId }` | Paused → active only when matching place is Open; no automatic rebooking |
 | `restore_item` | `lifecycle:write` | `{ itemId }` | Archived → queued, appended to area's Up next; done items cannot restore |
@@ -203,11 +203,11 @@ No ticket tool accepts an estimate, effort, points, owner ID, standalone mode or
 |---|---|---|---|
 | `search_books` | — | `{ query, cursor?, limit? }` | Bounded Open Library candidates with work/edition IDs, title/authors, ISBN/year/pages when present, automatic cover URL and source link |
 | `get_book_candidate` | — | `{ editionId }` or `{ isbn }` | Selected edition's normalized metadata; page-count provenance and missing-field warnings |
-| `queue_book` | `organizer:write` | `{ areaId, source: { type: "open_library", editionId } \| { type: "manual", title, authors, pageCount }, pageCountOverride? }` | Queued local book metadata snapshot and automatic cover/title-card choice; proposed one-local-book-per-work rule also rejects duplicate edition/ISBN |
-| `update_book` | `organizer:write` | `{ bookId, patch: { title?, authors?, pageCount? } }` | Edits permitted local metadata; lowering page count clamps current page in same transaction |
-| `set_book_progress` | `organizer:write` | `{ bookId, currentPage }` | Updates an active book's page; 0..pageCount; reaching final page returns `canFinish: true`, not automatic completion |
+| `queue_book` | `organizer:write` | `{ areaId, source: { type: "open_library", editionId } \| { type: "manual", title, authors, pageCount, progressUnit?: "pages" } \| { type: "manual", title, authors, progressUnit: "time", duration: { hours, minutes } }, pageCountOverride? }` | Queued local book metadata snapshot and automatic cover/title-card choice; proposed one-local-book-per-work rule also rejects duplicate edition/ISBN. Omitted progress unit stays pages. Audiobooks require a length of at least 1 minute, hours 0–999 and minutes 0–59, and reject a page count |
+| `update_book` | `organizer:write` | `{ bookId, patch: { title?, authors?, pageCount?, duration?: { hours, minutes } } }` | Edits permitted local metadata. Lowering page count clamps the current page. Lowering an audiobook duration clamps the listening position. pageCount is rejected on audiobooks and duration is rejected on page books |
+| `set_book_progress` | `organizer:write` | `{ bookId, currentPage }` or `{ bookId, position: { hours, minutes } }` | Exactly one of currentPage or position. Page books accept currentPage within 0..pageCount. Audiobooks accept a position within the stored length; minutes are 0–59. Reaching the end returns `canFinish: true` and `progressPercent`, not automatic completion. The other shape is a validation error |
 
-`finish_item` marks a book read and frees its place. Source IDs/ISBN are normalized by the server; never accept arbitrary fetch URLs. Missing page count requires an explicit positive count before adding. Persist whether the count is edition metadata, a work median, or a manual correction. `queue_book` imports the chosen edition and checks metadata server-side rather than trusting an agent-supplied cover URL. `search_books` and `get_book_candidate` use bounded cached human-directed lookups, not catalogue crawling. No upload, image generation, file path, custom cover URL or second provider is required.
+`finish_item` marks a book read and frees its place. A finished page book moves to its last page; a finished audiobook moves to the end of its length. Source IDs/ISBN are normalized by the server; never accept arbitrary fetch URLs. Missing page count requires an explicit positive count before adding a page book. Audiobook length is stored as whole minutes and shown as hours and minutes; percent is derived from position and length. Evening review `bookPages` entries stay `{ bookId, currentPage }` for page books and use `{ bookId, positionMinutes }` or `{ bookId, position: { hours, minutes } }` for audiobooks. Persist whether a page count is edition metadata, a work median, or a manual correction. `queue_book` imports the chosen edition and checks metadata server-side rather than trusting an agent-supplied cover URL. `search_books` and `get_book_candidate` use bounded cached human-directed lookups, not catalogue crawling. No upload, image generation, file path, custom cover URL or second provider is required.
 
 ### Calendar and Organizer bookings — 7 tools
 
@@ -255,7 +255,7 @@ slippedDestinations: [{
     | { kind: "back_to_todo" }
     | { kind: "book", start: Instant, end: Instant, allowOverlap: boolean }
 }]
-bookPages: [{ bookId, currentPage }]
+bookPages: [{ bookId, currentPage }] | [{ bookId, positionMinutes }] | [{ bookId, position: { hours, minutes } }]
 markReadBookIds: BookId[]
 learning: null | { text, target: { kind: "project" | "book", id } }
 ```
