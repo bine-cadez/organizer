@@ -25,15 +25,37 @@ export class OrganizerStore extends DurableObject<AppEnv> {
   private refreshing = new Map<CalendarRole, Promise<GoogleCredentials>>();
   constructor(ctx: DurableObjectState, env: AppEnv) {
     super(ctx, env);
+    // The books rebuild turns foreign keys off before the first write. workerd
+    // ignores PRAGMA foreign_keys=ON until the next event, so every later SQL
+    // entry tries again and only stops once the readback is on.
+    let schemaReady = false;
+    let foreignKeysOn = false;
+    const ensureForeignKeys = () => {
+      if (!schemaReady || foreignKeysOn) return;
+      ctx.storage.sql.exec("PRAGMA foreign_keys=ON");
+      foreignKeysOn =
+        Number(
+          ctx.storage.sql.exec("PRAGMA foreign_keys").toArray()[0]
+            ?.foreign_keys,
+        ) === 1;
+    };
     const db: DbPort = {
-      all: (sql, ...bindings) =>
-        ctx.storage.sql.exec(sql, ...bindings).toArray(),
+      all: (sql, ...bindings) => {
+        ensureForeignKeys();
+        return ctx.storage.sql.exec(sql, ...bindings).toArray();
+      },
       run: (sql, ...bindings) => {
+        ensureForeignKeys();
         ctx.storage.sql.exec(sql, ...bindings).toArray();
       },
-      transaction: (callback) => ctx.storage.transactionSync(callback),
+      transaction: (callback) => {
+        ensureForeignKeys();
+        return ctx.storage.transactionSync(callback);
+      },
     };
     this.engine = new OrganizerEngine(db);
+    schemaReady = true;
+    ensureForeignKeys();
   }
   snapshot() {
     return this.engine.snapshot();

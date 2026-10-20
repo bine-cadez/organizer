@@ -1094,6 +1094,22 @@ export function EditDialog({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          if (audio) {
+            if (
+              !Number.isInteger(hours) ||
+              !Number.isInteger(minutes) ||
+              hours < 0 ||
+              hours > 999 ||
+              minutes < 0 ||
+              minutes > 59 ||
+              (hours === 0 && minutes === 0)
+            ) {
+              setError(
+                "Enter a length of at least 1 minute. Minutes must be 0–59.",
+              );
+              return;
+            }
+          }
           command(
             item.kind === "project" ? "update_project" : "update_book",
             item.kind === "project"

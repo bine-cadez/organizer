@@ -167,6 +167,21 @@ export class OrganizerEngine {
     options: { now?: () => number } = {},
   ) {
     this.now = options.now ?? Date.now;
+    // workerd opens an implicit transaction on the first write and then ignores
+    // PRAGMA foreign_keys until a later event. Read the books shape first, and
+    // disable foreign keys before any write when a v1 table has to be rebuilt.
+    const bookColumns = this.db
+      .all("PRAGMA table_info(books)")
+      .map((row) => String(row.name));
+    const rebuildBooks =
+      bookColumns.length > 0 && !bookColumns.includes("progress_unit");
+    if (rebuildBooks) {
+      this.db.run("PRAGMA foreign_keys=OFF");
+      if (this.foreignKeysEnabled())
+        throw new Error(
+          "Could not disable foreign keys before rebuilding books. Existing books were left unchanged.",
+        );
+    }
     this.db.transaction(() => {
       for (const sql of SCHEMA) this.db.run(sql);
       this.db.run(
@@ -200,43 +215,43 @@ export class OrganizerEngine {
           );
       }
     });
-    this.migrateBookProgress();
-  }
-  /**
-   * Schema version 2 adds audiobook progress. Fresh databases already have the
-   * columns. A version-1 books table is rebuilt in place; every existing row
-   * stays a page book with its page count and current page unchanged.
-   */
-  private migrateBookProgress() {
-    const columns = this.db
-      .all("PRAGMA table_info(books)")
-      .map((row) => String(row.name));
-    if (!columns.includes("progress_unit")) {
-      this.db.run("PRAGMA foreign_keys=OFF");
-      try {
-        this.db.transaction(() => {
-          this.db.run(
-            BOOKS_DDL.replace(
-              "CREATE TABLE IF NOT EXISTS books(",
-              "CREATE TABLE books__next(",
-            ),
-          );
-          this.db.run(
-            `INSERT INTO books__next(id,area_id,title,authors_json,work_id,edition_id,isbn,cover_url,cover_id,page_count,page_count_source,current_page,progress_unit,duration_minutes,position_minutes,state,started_at,paused_at,archived_at,done_at,created_at,updated_at,version)
-             SELECT id,area_id,title,authors_json,work_id,edition_id,isbn,cover_url,cover_id,page_count,page_count_source,current_page,'pages',NULL,0,state,started_at,paused_at,archived_at,done_at,created_at,updated_at,version FROM books`,
-          );
-          this.db.run("DROP TABLE books");
-          this.db.run("ALTER TABLE books__next RENAME TO books");
-          for (const sql of BOOK_INDEXES) this.db.run(sql);
-        });
-      } finally {
-        this.db.run("PRAGMA foreign_keys=ON");
-      }
-    }
+    if (rebuildBooks) this.rebuildBooksTable();
     this.db.run(
       "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,?)",
       this.now(),
     );
+  }
+  private foreignKeysEnabled() {
+    return Number(this.db.all("PRAGMA foreign_keys")[0]?.foreign_keys) === 1;
+  }
+  /**
+   * Schema version 2 adds audiobook progress. Fresh databases already have the
+   * columns from SCHEMA. A version-1 books table is rebuilt in place; every
+   * existing row stays a page book. Foreign keys are turned off only for that
+   * rebuild, because queue entries and learnings reference books. On workerd the
+   * matching PRAGMA foreign_keys=ON is ignored until the next event;
+   * OrganizerStore repeats it there and checks the readback.
+   */
+  private rebuildBooksTable() {
+    try {
+      this.db.transaction(() => {
+        this.db.run(
+          BOOKS_DDL.replace(
+            "CREATE TABLE IF NOT EXISTS books(",
+            "CREATE TABLE books__next(",
+          ),
+        );
+        this.db.run(
+          `INSERT INTO books__next(id,area_id,title,authors_json,work_id,edition_id,isbn,cover_url,cover_id,page_count,page_count_source,current_page,progress_unit,duration_minutes,position_minutes,state,started_at,paused_at,archived_at,done_at,created_at,updated_at,version)
+           SELECT id,area_id,title,authors_json,work_id,edition_id,isbn,cover_url,cover_id,page_count,page_count_source,current_page,'pages',NULL,0,state,started_at,paused_at,archived_at,done_at,created_at,updated_at,version FROM books`,
+        );
+        this.db.run("DROP TABLE books");
+        this.db.run("ALTER TABLE books__next RENAME TO books");
+        for (const sql of BOOK_INDEXES) this.db.run(sql);
+      });
+    } finally {
+      this.db.run("PRAGMA foreign_keys=ON");
+    }
   }
   private at() {
     return this.ctx?.at ?? this.now();

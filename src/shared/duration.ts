@@ -1,9 +1,12 @@
 /** Canonical audiobook length is whole minutes. 999h 59m matches the books CHECK. */
 export const MAX_AUDIO_MINUTES = 999 * 60 + 59;
 
+/** Floor, so the value reaches 100 only when current is the whole total. */
 export function progressPercent(current: number, total: number): number {
   if (total <= 0) return 0;
-  return Math.round((Math.min(Math.max(current, 0), total) / total) * 100);
+  const clamped = Math.min(Math.max(current, 0), total);
+  if (clamped >= total) return 100;
+  return Math.floor((clamped / total) * 100);
 }
 
 export function splitDuration(totalMinutes: number): {

@@ -2,6 +2,7 @@ import {
   formatAudiobookProgress,
   formatDuration,
   isAudiobook,
+  progressPercent,
   splitDuration,
 } from "../shared/duration";
 import type {
@@ -12,7 +13,13 @@ import type {
   CalendarEvent,
 } from "../shared/types";
 
-export { formatAudiobookProgress, formatDuration, isAudiobook, splitDuration };
+export {
+  formatAudiobookProgress,
+  formatDuration,
+  isAudiobook,
+  progressPercent,
+  splitDuration,
+};
 
 export class ApiError extends Error {
   code: string;

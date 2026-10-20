@@ -5,6 +5,7 @@ import {
   formatAudiobookProgress,
   formatDuration,
   isAudiobook,
+  progressPercent,
   request,
   safe,
   splitDuration,
@@ -226,10 +227,7 @@ function BookDetail({ item, onClose }: { item: Item; onClose: () => void }) {
             </strong>
             {!audio && (
               <span>
-                {Math.round(
-                  ((item.currentPage ?? 0) / (item.pageCount || 1)) * 100,
-                )}
-                %
+                {progressPercent(item.currentPage ?? 0, item.pageCount || 1)}%
               </span>
             )}
           </div>
