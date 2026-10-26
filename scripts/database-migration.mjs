@@ -89,10 +89,13 @@ export function readDomain(database) {
   const versions = tables
     .find((table) => table.name === "schema_versions")
     .rows.map((row) => row[0]);
+  // Version 3 adds indexes only. Rows and columns are unchanged from version 2.
   assert.ok(
     versions.length > 0 &&
-      versions.every((version) => version === 1 || version === 2) &&
-      Math.max(...versions) <= 2,
+      versions.every(
+        (version) => version === 1 || version === 2 || version === 3,
+      ) &&
+      Math.max(...versions) <= 3,
     "Unsupported database version.",
   );
   return {

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { CALENDAR_SYNC_INTERVAL_MS } from "../domain/retention";
 import type { Snapshot } from "../shared/types";
 import { ApiError, request, safe } from "./api";
 import { AppContext, type ModalState } from "./context";
@@ -89,7 +90,7 @@ export default function App() {
   useEffect(() => {
     if (!session?.authenticated) return;
     const focus = () => safe(refresh());
-    const timer = window.setInterval(focus, 300000);
+    const timer = window.setInterval(focus, CALENDAR_SYNC_INTERVAL_MS);
     window.addEventListener("focus", focus);
     return () => {
       clearInterval(timer);

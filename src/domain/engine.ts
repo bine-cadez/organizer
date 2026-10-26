@@ -17,6 +17,18 @@ import { progressPercent } from "../shared/duration";
 import { BOOK_INDEXES, BOOKS_DDL, SCHEMA } from "../storage/schema";
 import { DomainError } from "./errors";
 import {
+  AUDIT_RETENTION_MS,
+  CALENDAR_FUTURE_RETENTION_MS,
+  CALENDAR_PAST_RETENTION_MS,
+  CALENDAR_SYNC_FUTURE_MS,
+  CALENDAR_SYNC_INTERVAL_MS,
+  CALENDAR_SYNC_PAST_MS,
+  CLEANUP_BATCH_LIMIT,
+  CLEANUP_DAILY_ROW_BUDGET,
+  OUTBOX_RETENTION_MS,
+  RECEIPT_RETENTION_MS,
+} from "./retention";
+import {
   TIMEZONE,
   addDays,
   dayBounds,
@@ -124,6 +136,9 @@ const READ_SCOPES: Record<string, string> = {
 };
 const terminal = new Set(["archived", "done"]);
 const inactiveOps = new Set(["succeeded", "failed", "superseded"]);
+/** Earlier rows in these states hold later work on the same booking. claimOperation and earliestPendingAttempt share this list. */
+const BLOCKING_OPERATION_STATES =
+  "('pending','running','waiting_retry','needs_reconnect','failed')";
 const uid = (prefix: string) =>
   prefix + "_" + crypto.randomUUID().replaceAll("-", "");
 const canonical = (v: any): string =>
@@ -161,6 +176,9 @@ export class OrganizerEngine {
     operations: string[];
     entities: string[];
     preview: boolean;
+    /** System maintenance. Touches bump only rows that existed before the command. */
+    system?: boolean;
+    watermark?: Record<string, number>;
   };
   constructor(
     private db: DbPort,
@@ -186,20 +204,27 @@ export class OrganizerEngine {
       try {
         this.installSchema();
         this.rebuildBooksTable();
-        this.db.run(
-          "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,?)",
-          this.now(),
-        );
+        this.recordSchema(2);
+        this.recordSchema(3);
       } finally {
         this.db.run("PRAGMA foreign_keys=ON");
       }
     } else {
       this.installSchema();
-      this.db.run(
-        "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(2,?)",
-        this.now(),
-      );
+      this.recordSchema(2);
+      this.recordSchema(3);
     }
+  }
+  /**
+   * Version 3 adds indexes for bounded calendar reads and bookkeeping purge.
+   * CREATE INDEX IF NOT EXISTS does not rewrite existing rows.
+   */
+  private recordSchema(version: number) {
+    this.db.run(
+      "INSERT OR IGNORE INTO schema_versions(version,applied_at) VALUES(?,?)",
+      version,
+      this.now(),
+    );
   }
   private installSchema() {
     this.db.transaction(() => {
@@ -441,7 +466,7 @@ export class OrganizerEngine {
   }
   private touch(table: string, id: string, key: string) {
     if (this.ctx?.touched.has(key)) return;
-    if (!this.ctx || this.ctx.before[key])
+    if (this.existedBefore(table, id, key))
       this.db.run(
         `UPDATE ${table} SET version=version+1,updated_at=? WHERE id=?`,
         this.at(),
@@ -449,6 +474,33 @@ export class OrganizerEngine {
       );
     this.ctx?.touched.add(key);
     if (this.ctx && !this.ctx.entities.includes(id)) this.ctx.entities.push(id);
+  }
+  /**
+   * User commands compare against the version map captured at the start.
+   * System work captures only MAX(rowid) per table, which is a single index
+   * probe, and bumps a row only when its rowid is inside that watermark.
+   */
+  private existedBefore(table: string, id: string, key: string): boolean {
+    if (!this.ctx) return true;
+    if (!this.ctx.system) return Boolean(this.ctx.before[key]);
+    const row = this.one(`SELECT rowid AS n FROM ${table} WHERE id=?`, id);
+    return row != null && Number(row.n) <= (this.ctx.watermark?.[table] ?? 0);
+  }
+  private watermarks(): Record<string, number> {
+    const tables = [
+      "projects",
+      "books",
+      "tickets",
+      "bookings",
+      "outbox_operations",
+      "reviews",
+    ];
+    const out: Record<string, number> = {};
+    for (const table of tables)
+      out[table] = Number(
+        this.one(`SELECT MAX(rowid) AS n FROM ${table}`)?.n ?? 0,
+      );
+    return out;
   }
   private itemTouch(item: Item) {
     this.touch(
@@ -632,28 +684,49 @@ export class OrganizerEngine {
         ?.setup_skipped,
     };
   }
-  private eventProjection(): CalendarEvent[] {
-    const cutoff = this.at() - 86400000;
-    return this.db
-      .all(
-        `SELECT e.*,a.role,a.status,a.updated_at AS account_updated FROM calendar_events e JOIN calendar_accounts a ON a.id=e.account_id WHERE e.deleted_at IS NULL`,
-      )
-      .filter((r) => r.status === "connected" || r.account_updated > cutoff)
-      .map((r) => ({
-        id: `${r.account_id}:${r.calendar_id}:${r.google_event_id}`,
-        accountId: r.account_id,
-        role: r.role,
-        calendarId: r.calendar_id,
-        googleEventId: r.google_event_id,
-        title: r.title,
-        start: iso(r.start_utc),
-        end: iso(r.end_utc),
-        allDay: !!r.all_day,
-        isBusy: !!r.is_busy,
-        startDate: r.start_date ?? undefined,
-        endDate: r.end_date ?? undefined,
-        etag: r.etag ?? undefined,
-      }));
+  /**
+   * Reads the calendar mirror for one window. The default window is the
+   * retention horizon (what the week view can still show). Callers that know
+   * a tighter interval pass it so SQLite can satisfy the read from the
+   * partial end/start indexes instead of the whole table.
+   */
+  private eventProjection(window?: {
+    start: number;
+    end: number;
+  }): CalendarEvent[] {
+    const at = this.at();
+    const start = window?.start ?? at - CALENDAR_PAST_RETENTION_MS;
+    const end = window?.end ?? at + CALENDAR_FUTURE_RETENTION_MS;
+    const cutoff = at - 86400000;
+    const startDate = localParts(start).date;
+    const endDate = localParts(Math.max(start, end - 1)).date;
+    const timed = this.db.all(
+      `SELECT e.*,a.role,a.status,a.updated_at AS account_updated FROM calendar_events e JOIN calendar_accounts a ON a.id=e.account_id WHERE e.deleted_at IS NULL AND e.all_day=0 AND e.end_utc>? AND e.start_utc<? AND (a.status='connected' OR a.updated_at>?)`,
+      start,
+      end,
+      cutoff,
+    );
+    const allDay = this.db.all(
+      `SELECT e.*,a.role,a.status,a.updated_at AS account_updated FROM calendar_events e JOIN calendar_accounts a ON a.id=e.account_id WHERE e.deleted_at IS NULL AND e.all_day=1 AND e.end_date>? AND e.start_date<=? AND (a.status='connected' OR a.updated_at>?)`,
+      startDate,
+      endDate,
+      cutoff,
+    );
+    return [...timed, ...allDay].map((r) => ({
+      id: `${r.account_id}:${r.calendar_id}:${r.google_event_id}`,
+      accountId: r.account_id,
+      role: r.role,
+      calendarId: r.calendar_id,
+      googleEventId: r.google_event_id,
+      title: r.title,
+      start: iso(r.start_utc),
+      end: iso(r.end_utc),
+      allDay: !!r.all_day,
+      isBusy: !!r.is_busy,
+      startDate: r.start_date ?? undefined,
+      endDate: r.end_date ?? undefined,
+      etag: r.etag ?? undefined,
+    }));
   }
   private meta() {
     const versions = this.versions();
@@ -1060,7 +1133,10 @@ export class OrganizerEngine {
           end = this.instant(a.end);
         this.intervalWindow(start, end);
         if (a.detail === "titles") this.scope(actor, "calendar:details:read");
-        const rows = this.authorizedEvents(actor, a.detail).filter(
+        const rows = this.authorizedEvents(actor, a.detail, {
+          start,
+          end,
+        }).filter(
           (e: any) =>
             (!a.roles || a.roles.includes(e.role)) &&
             (e.allDay
@@ -1212,11 +1288,15 @@ export class OrganizerEngine {
     if (item.state === "archived") return ["restore_item"];
     return [];
   }
-  private authorizedEvents(actor: Actor, detail?: string) {
+  private authorizedEvents(
+    actor: Actor,
+    detail?: string,
+    window?: { start: number; end: number },
+  ) {
     if (!this.can(actor, "calendar:busy:read")) return [];
     const titles =
       detail === "titles" && this.can(actor, "calendar:details:read");
-    return this.eventProjection().map((e) => ({
+    return this.eventProjection(window).map((e) => ({
       ...e,
       title: titles ? e.title : "Busy",
     }));
@@ -1235,7 +1315,7 @@ export class OrganizerEngine {
         (a) =>
           a.status === "connected" &&
           a.last_synced_at != null &&
-          a.last_synced_at >= this.at() - 300000,
+          a.last_synced_at >= this.at() - CALENDAR_SYNC_INTERVAL_MS,
       );
   }
   private busy(
@@ -1247,7 +1327,7 @@ export class OrganizerEngine {
       ? this.one("SELECT * FROM bookings WHERE id=?", exclude)
       : undefined;
     const out: { start: number; end: number; id: string }[] = [];
-    for (const e of this.eventProjection()) {
+    for (const e of this.eventProjection({ start, end })) {
       if (e.allDay || !e.isBusy || !e.start || !e.end) continue;
       if (
         excluded &&
@@ -2980,12 +3060,14 @@ export class OrganizerEngine {
         args: {},
         at: this.now(),
         commandId: uid("sys"),
-        before: this.versions(),
+        before: {},
         required: {},
         touched: new Set(),
         operations: [],
         entities: [],
         preview: true,
+        system: true,
+        watermark: this.watermarks(),
       };
       try {
         const result = fn();
@@ -3173,12 +3255,19 @@ export class OrganizerEngine {
               endParts.hour === 0 && endParts.minute === 0
                 ? endParts.date
                 : addDays(endParts.date, 1);
+          // Split timed and all-day deletes so each predicate can use its index.
+          // A single OR of the two ranges cannot.
           this.db.run(
-            "DELETE FROM calendar_events WHERE account_id=? AND calendar_id=? AND ((all_day=0 AND start_utc<? AND end_utc>?) OR (all_day=1 AND start_date<? AND end_date>?))",
+            "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE account_id=? AND calendar_id=? AND all_day=0 AND start_utc<? AND end_utc>?)",
             account.id,
             input.calendarId,
             end,
             start,
+          );
+          this.db.run(
+            "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE account_id=? AND calendar_id=? AND all_day=1 AND start_date<? AND end_date>?)",
+            account.id,
+            input.calendarId,
             lastDate,
             firstDate,
           );
@@ -3415,7 +3504,7 @@ export class OrganizerEngine {
         return null;
       if (op.booking_id) {
         const earlier = this.one(
-          "SELECT id FROM outbox_operations WHERE booking_id=? AND rowid<? AND state IN ('pending','running','waiting_retry','needs_reconnect','failed')",
+          `SELECT id FROM outbox_operations WHERE booking_id=? AND rowid<? AND state IN ${BLOCKING_OPERATION_STATES}`,
           op.booking_id,
           op.sequence,
         );
@@ -3551,5 +3640,145 @@ export class OrganizerEngine {
     this.internal("setup_skipped", () =>
       this.db.run("UPDATE settings SET setup_skipped=1 WHERE id=1"),
     );
+  }
+  /**
+   * Earliest pending/retry instant that claimOperation would actually take.
+   * An update held behind an earlier failed or reconnecting op on the same
+   * booking is not due: waking for it spins the alarm without doing work.
+   */
+  earliestPendingAttempt(): number | null {
+    const row = this.one(
+      `SELECT MIN(op.next_attempt_at) AS next FROM outbox_operations op WHERE op.state IN ('pending','waiting_retry') AND NOT EXISTS (SELECT 1 FROM outbox_operations earlier WHERE earlier.booking_id=op.booking_id AND op.booking_id IS NOT NULL AND earlier.rowid<op.rowid AND earlier.state IN ${BLOCKING_OPERATION_STATES})`,
+    );
+    return row?.next == null ? null : Number(row.next);
+  }
+  hasConnectedCalendar(): boolean {
+    return Boolean(
+      this.one(
+        "SELECT 1 AS ok FROM calendar_accounts WHERE status='connected' LIMIT 1",
+      ),
+    );
+  }
+  connectionsDueForSync(staleBefore: number): CalendarRole[] {
+    return this.db
+      .all(
+        "SELECT role FROM calendar_accounts WHERE status='connected' AND (last_synced_at IS NULL OR last_synced_at<=?)",
+        staleBefore,
+      )
+      .map((row) => row.role as CalendarRole);
+  }
+  /** Present bookings already observed on one calendar. Indexed by account + calendar. */
+  presentBookingEventIds(accountId: string, calendarId: string): string[] {
+    return this.db
+      .all(
+        "SELECT google_event_id FROM bookings WHERE account_id=? AND calendar_id=? AND desired_presence='present' AND (sync_state='synced' OR remote_start_utc IS NOT NULL)",
+        accountId,
+        calendarId,
+      )
+      .map((row) => String(row.google_event_id));
+  }
+  /** Default alarm window, or the caller's range normalized to UTC instants. */
+  syncWindow(range?: { start: string; end: string }): {
+    start: string;
+    end: string;
+  } {
+    if (range)
+      return {
+        start: new Date(range.start).toISOString(),
+        end: new Date(range.end).toISOString(),
+      };
+    const midnight = Date.parse(`${localParts(this.now()).date}T00:00:00Z`);
+    return {
+      start: new Date(midnight - CALENDAR_SYNC_PAST_MS).toISOString(),
+      end: new Date(midnight + CALENDAR_SYNC_FUTURE_MS).toISOString(),
+    };
+  }
+  /**
+   * Deletes expired calendar-mirror and bookkeeping rows, sharing one row
+   * budget across every table. Projects, books, tickets, learnings, reviews,
+   * and bookings are never deleted. Failed, pending, running, waiting_retry,
+   * and needs_reconnect outbox rows stay so Retry still works and later work
+   * on that booking stays blocked.
+   * `more` means the budget ran out with rows still eligible.
+   */
+  cleanupBookkeeping(limit = CLEANUP_DAILY_ROW_BUDGET): {
+    more: boolean;
+    deleted: number;
+  } {
+    if (limit <= 0) return { more: true, deleted: 0 };
+    const now = this.now();
+    const past = now - CALENDAR_PAST_RETENTION_MS;
+    const future = now + CALENDAR_FUTURE_RETENTION_MS;
+    const pastDate = localParts(past).date;
+    const futureDate = localParts(future).date;
+    let remaining = limit;
+    let deleted = 0;
+    const statements: { sql: string; probe: string; bindings: any[] }[] = [
+      {
+        sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NOT NULL LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM calendar_events WHERE deleted_at IS NOT NULL LIMIT 1",
+        bindings: [],
+      },
+      {
+        sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND end_utc<=? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND end_utc<=? LIMIT 1",
+        bindings: [past],
+      },
+      {
+        sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND start_utc>=? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND start_utc>=? LIMIT 1",
+        bindings: [future],
+      },
+      {
+        sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND end_date<=? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND end_date<=? LIMIT 1",
+        bindings: [pastDate],
+      },
+      {
+        sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND start_date>? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND start_date>? LIMIT 1",
+        bindings: [futureDate],
+      },
+      {
+        sql: "DELETE FROM outbox_operations WHERE rowid IN (SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','superseded') AND updated_at<? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','superseded') AND updated_at<? LIMIT 1",
+        bindings: [now - OUTBOX_RETENTION_MS],
+      },
+      {
+        sql: "DELETE FROM command_receipts WHERE rowid IN (SELECT rowid FROM command_receipts WHERE committed_at<? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM command_receipts WHERE committed_at<? LIMIT 1",
+        bindings: [now - RECEIPT_RETENTION_MS],
+      },
+      {
+        sql: "DELETE FROM audit_log WHERE rowid IN (SELECT rowid FROM audit_log WHERE occurred_at<? LIMIT ?) RETURNING rowid",
+        probe: "SELECT rowid FROM audit_log WHERE occurred_at<? LIMIT 1",
+        bindings: [now - AUDIT_RETENTION_MS],
+      },
+    ];
+    const stillEligible = (probe: string, bindings: any[]) =>
+      this.db.all(probe, ...bindings).length > 0;
+    for (const { sql, probe, bindings } of statements) {
+      if (remaining <= 0) {
+        if (stillEligible(probe, bindings)) return { more: true, deleted };
+        continue;
+      }
+      while (remaining > 0) {
+        const batch = Math.min(CLEANUP_BATCH_LIMIT, remaining);
+        const removed = this.db.all(sql, ...bindings, batch);
+        deleted += removed.length;
+        remaining -= removed.length;
+        if (removed.length < batch) break;
+        if (remaining === 0 && stillEligible(probe, bindings))
+          return { more: true, deleted };
+      }
+    }
+    return { more: false, deleted };
   }
 }

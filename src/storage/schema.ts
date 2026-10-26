@@ -27,6 +27,16 @@ export const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS calendar_sources(account_id TEXT NOT NULL REFERENCES calendar_accounts(id), calendar_id TEXT NOT NULL, sync_token TEXT, last_synced_at INTEGER, PRIMARY KEY(account_id,calendar_id))`,
   `CREATE TABLE IF NOT EXISTS calendar_events(account_id TEXT NOT NULL REFERENCES calendar_accounts(id), calendar_id TEXT NOT NULL, google_event_id TEXT NOT NULL, title TEXT NOT NULL, start_utc INTEGER, end_utc INTEGER, all_day INTEGER NOT NULL CHECK(all_day IN (0,1)), start_date TEXT, end_date TEXT, is_busy INTEGER NOT NULL CHECK(is_busy IN (0,1)), etag TEXT, deleted_at INTEGER, cached_at INTEGER NOT NULL, CHECK((all_day=0 AND start_utc IS NOT NULL AND end_utc>start_utc) OR (all_day=1 AND start_date IS NOT NULL AND end_date>start_date)), PRIMARY KEY(account_id,calendar_id,google_event_id))`,
   `CREATE INDEX IF NOT EXISTS events_interval ON calendar_events(start_utc,end_utc)`,
+  // Full-sync replace deletes a time range for one calendar. The account and
+  // interval columns let that delete search instead of scanning the mirror.
+  `CREATE INDEX IF NOT EXISTS events_account_span ON calendar_events(account_id,calendar_id,start_utc,end_utc) WHERE all_day=0`,
+  `CREATE INDEX IF NOT EXISTS events_account_dates ON calendar_events(account_id,calendar_id,start_date,end_date) WHERE all_day=1`,
+  // Partial indexes so live-event reads and tombstone purges do not scan the whole mirror.
+  `CREATE INDEX IF NOT EXISTS events_active_end ON calendar_events(end_utc) WHERE deleted_at IS NULL AND all_day=0`,
+  `CREATE INDEX IF NOT EXISTS events_active_start ON calendar_events(start_utc) WHERE deleted_at IS NULL AND all_day=0`,
+  `CREATE INDEX IF NOT EXISTS events_active_end_date ON calendar_events(end_date) WHERE deleted_at IS NULL AND all_day=1`,
+  `CREATE INDEX IF NOT EXISTS events_active_start_date ON calendar_events(start_date) WHERE deleted_at IS NULL AND all_day=1`,
+  `CREATE INDEX IF NOT EXISTS events_tombstones ON calendar_events(deleted_at) WHERE deleted_at IS NOT NULL`,
   `CREATE TABLE IF NOT EXISTS bookings(id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), account_id TEXT NOT NULL REFERENCES calendar_accounts(id), calendar_id TEXT NOT NULL, google_event_id TEXT NOT NULL, start_utc INTEGER NOT NULL, end_utc INTEGER NOT NULL CHECK(end_utc>start_utc), remote_start_utc INTEGER, remote_end_utc INTEGER, remote_etag TEXT, desired_presence TEXT NOT NULL DEFAULT 'present' CHECK(desired_presence IN ('present','absent')), sync_state TEXT NOT NULL DEFAULT 'pending' CHECK(sync_state IN ('pending','synced','failed')), retired_at INTEGER, provider_deleted_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1, UNIQUE(account_id,calendar_id,google_event_id), UNIQUE(ticket_id,id))`,
   `CREATE INDEX IF NOT EXISTS booking_ticket ON bookings(ticket_id,start_utc)`,
   `CREATE TRIGGER IF NOT EXISTS booking_personal_insert BEFORE INSERT ON bookings WHEN NOT EXISTS(SELECT 1 FROM calendar_accounts WHERE id=NEW.account_id AND role='personal') BEGIN SELECT RAISE(ABORT,'Bookings require the personal account'); END`,
@@ -38,10 +48,12 @@ export const SCHEMA: string[] = [
   `CREATE INDEX IF NOT EXISTS learning_book ON learnings(book_id,created_on DESC,id)`,
   `CREATE TABLE IF NOT EXISTS daily_dismissals(local_date TEXT PRIMARY KEY, dismissed_at INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS command_receipts(id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, tool TEXT NOT NULL, idempotency_key TEXT NOT NULL, fingerprint TEXT NOT NULL, response_json TEXT NOT NULL, committed_at INTEGER NOT NULL, UNIQUE(actor_id,tool,idempotency_key))`,
+  `CREATE INDEX IF NOT EXISTS receipts_committed ON command_receipts(committed_at)`,
   `CREATE TABLE IF NOT EXISTS audit_log(id TEXT PRIMARY KEY, command_id TEXT, actor_id TEXT NOT NULL, actor_type TEXT NOT NULL, action TEXT NOT NULL, entity_ids_json TEXT NOT NULL, summary TEXT NOT NULL, occurred_at INTEGER NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS audit_time ON audit_log(occurred_at,id)`,
   `CREATE TABLE IF NOT EXISTS outbox_operations(id TEXT PRIMARY KEY, command_id TEXT, actor_id TEXT NOT NULL, required_scope TEXT NOT NULL, booking_id TEXT REFERENCES bookings(id), account_id TEXT NOT NULL REFERENCES calendar_accounts(id), action TEXT NOT NULL CHECK(action IN ('create','update','delete','sync')), payload_json TEXT NOT NULL CHECK(json_valid(payload_json)), target_booking_version INTEGER, state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','running','waiting_retry','needs_reconnect','succeeded','failed','superseded')), attempt_count INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL, lease_until INTEGER, error_code TEXT, error_message TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1)`,
   `CREATE INDEX IF NOT EXISTS operations_due ON outbox_operations(state,next_attempt_at,created_at)`,
   `CREATE INDEX IF NOT EXISTS operations_booking ON outbox_operations(booking_id,created_at)`,
+  `CREATE INDEX IF NOT EXISTS operations_terminal ON outbox_operations(state,updated_at)`,
   `CREATE TABLE IF NOT EXISTS cursors(id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, fingerprint TEXT NOT NULL, owner_revision TEXT NOT NULL, offset_value INTEGER NOT NULL, expires_at INTEGER NOT NULL)`,
 ];

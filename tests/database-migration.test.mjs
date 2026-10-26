@@ -181,7 +181,7 @@ describe("database transfer", () => {
       .prepare("SELECT version FROM schema_versions ORDER BY version")
       .all()
       .map((row) => row.version);
-    expect(versions).toEqual([1, 2]);
+    expect(versions).toEqual([1, 2, 3]);
     expect(
       db.prepare("SELECT id, book_id FROM queue_entries ORDER BY id").all(),
     ).toEqual([
@@ -199,7 +199,7 @@ describe("database transfer", () => {
         .prepare("SELECT version FROM schema_versions ORDER BY version")
         .all()
         .map((row) => row.version),
-    ).toEqual([1, 2]);
+    ).toEqual([1, 2, 3]);
     expect(db.prepare("PRAGMA foreign_keys").get().foreign_keys).toBe(1);
     expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     expect(
