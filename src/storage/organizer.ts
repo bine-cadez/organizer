@@ -20,10 +20,13 @@ import {
   ALARM_RECOVERY_MS,
   CALENDAR_SYNC_INTERVAL_MS,
   CLEANUP_AT_KEY,
+  CLEANUP_DAILY_ROW_BUDGET,
   CLEANUP_INTERVAL_MS,
+  CLEANUP_PROGRESS_KEY,
 } from "../domain/retention";
 
 type CalendarRange = { start: string; end: string };
+type CleanupProgress = { startedAt: number; deleted: number };
 
 export class OrganizerStore extends DurableObject<AppEnv> {
   private engine: OrganizerEngine;
@@ -387,14 +390,18 @@ export class OrganizerStore extends DurableObject<AppEnv> {
       this.syncing.delete(key);
     }
   }
-  private async arm(options?: { failed?: boolean; cleanupPending?: boolean }) {
+  private async arm(options?: {
+    failed?: boolean;
+    cleanupPending?: boolean;
+    claimedNothing?: boolean;
+  }) {
     this.ensureForeignKeys();
     if (options?.failed) {
       await this.ctx.storage.setAlarm(Date.now() + ALARM_RECOVERY_MS);
       return;
     }
     const earliest = this.engine.earliestPendingAttempt();
-    const next =
+    let next =
       earliest == null
         ? this.engine.hasConnectedCalendar()
           ? Date.now() + CALENDAR_SYNC_INTERVAL_MS
@@ -402,15 +409,34 @@ export class OrganizerStore extends DurableObject<AppEnv> {
             ? Date.now() + CLEANUP_INTERVAL_MS
             : null
         : Math.max(Date.now() + 100, earliest);
+    // Held rows look due but claimOperation skips them. An alarm that took
+    // nothing waits out the sync interval instead of re-arming a few milliseconds ahead.
+    if (options?.claimedNothing && next != null)
+      next = Math.max(next, Date.now() + CALENDAR_SYNC_INTERVAL_MS);
     if (next == null) await this.ctx.storage.deleteAlarm();
     else await this.ctx.storage.setAlarm(next);
   }
   private cleanupIfDue(): boolean {
+    const now = Date.now();
     const last = this.ctx.storage.kv.get<number>(CLEANUP_AT_KEY) ?? 0;
-    if (Date.now() - last < CLEANUP_INTERVAL_MS) return false;
-    const more = this.engine.cleanupBookkeeping();
-    this.ctx.storage.kv.put(CLEANUP_AT_KEY, Date.now());
-    return more;
+    if (now - last < CLEANUP_INTERVAL_MS) return false;
+    const stored =
+      this.ctx.storage.kv.get<CleanupProgress>(CLEANUP_PROGRESS_KEY);
+    const progress =
+      stored != null && now - stored.startedAt < CLEANUP_INTERVAL_MS
+        ? stored
+        : null;
+    if (progress && progress.deleted >= CLEANUP_DAILY_ROW_BUDGET) return true;
+    const already = progress?.deleted ?? 0;
+    const result = this.engine.cleanupBookkeeping(
+      CLEANUP_DAILY_ROW_BUDGET - already,
+    );
+    this.ctx.storage.kv.put(CLEANUP_PROGRESS_KEY, {
+      startedAt: progress?.startedAt ?? now,
+      deleted: already + result.deleted,
+    });
+    if (!result.more) this.ctx.storage.kv.put(CLEANUP_AT_KEY, now);
+    return result.more;
   }
   async alarm() {
     // setAlarm writes. On workerd that opens the event's implicit transaction
@@ -430,6 +456,7 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     }
     let failed = false;
     let cleanupPending = false;
+    let claimed = 0;
     try {
       cleanupPending = this.cleanupIfDue();
     } catch (error) {
@@ -443,6 +470,7 @@ export class OrganizerStore extends DurableObject<AppEnv> {
       for (const operation of this.engine.dueOperations(10)) {
         const work = this.engine.claimOperation(operation.id);
         if (!work) continue;
+        claimed += 1;
         try {
           if (!work.account)
             throw new CalendarProviderError(
@@ -583,7 +611,11 @@ export class OrganizerStore extends DurableObject<AppEnv> {
       );
     }
     try {
-      await this.arm({ failed, cleanupPending });
+      await this.arm({
+        failed,
+        cleanupPending,
+        claimedNothing: claimed === 0,
+      });
     } catch (error) {
       console.error(
         "organizer alarm could not reschedule",

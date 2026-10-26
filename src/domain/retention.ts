@@ -13,15 +13,25 @@ export const ALARM_RECOVERY_MS = 15 * 60 * 1000;
 export const CALENDAR_SYNC_PAST_MS = 7 * 24 * 60 * 60 * 1000;
 export const CALENDAR_SYNC_FUTURE_MS = 28 * 24 * 60 * 60 * 1000;
 
-/** Bookkeeping purge runs at most once per this interval. */
+/**
+ * A purge that finished (nothing left) waits this long before running again.
+ * A purge that stops on the daily row budget continues on a later day.
+ */
 export const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 /** Rows deleted per statement. One pass never scans or deletes an unbounded set. */
 export const CLEANUP_BATCH_LIMIT = 200;
-/** How many batches one daily pass will issue for a single table. */
-export const CLEANUP_MAX_BATCHES = 25;
+/**
+ * Shared cap for one purge, across every table. Cloudflare's free tier counts
+ * index maintenance toward rows_written (100k/day); staying near 2k deleted
+ * rows leaves room for those index writes. Leftovers continue the next day.
+ */
+export const CLEANUP_DAILY_ROW_BUDGET = 2000;
+/** Set only when a purge finishes. A partial purge leaves this unset so the next alarm can continue. */
 export const CLEANUP_AT_KEY = "maintenance:cleaned_at";
+/** Rows already deleted in the current daily budget window. */
+export const CLEANUP_PROGRESS_KEY = "maintenance:cleanup_progress";
 
-/** Finished outbox rows and idempotency receipts are kept this long. */
+/** Succeeded and superseded outbox rows, and idempotency receipts, are kept this long. */
 export const OUTBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** System and command audit rows. Not user-authored notes. */

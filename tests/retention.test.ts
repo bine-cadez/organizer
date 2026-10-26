@@ -8,9 +8,9 @@ import {
   CALENDAR_PAST_RETENTION_MS,
   CALENDAR_SYNC_INTERVAL_MS,
   CLEANUP_AT_KEY,
-  CLEANUP_BATCH_LIMIT,
+  CLEANUP_DAILY_ROW_BUDGET,
   CLEANUP_INTERVAL_MS,
-  CLEANUP_MAX_BATCHES,
+  CLEANUP_PROGRESS_KEY,
   OUTBOX_RETENTION_MS,
   RECEIPT_RETENTION_MS,
 } from "../src/domain/retention";
@@ -28,6 +28,8 @@ const NEW_INDEXES = [
   "events_active_end_date",
   "events_active_start_date",
   "events_tombstones",
+  "events_account_span",
+  "events_account_dates",
   "operations_terminal",
   "receipts_committed",
 ];
@@ -271,7 +273,9 @@ describe("bookkeeping retention", () => {
         );
     insertOp("op-keep-exact", "succeeded", cutoff);
     insertOp("op-drop-old", "succeeded", cutoff - 1);
-    insertOp("op-drop-failed", "failed", cutoff - 1);
+    insertOp("op-keep-failed", "failed", cutoff - 1);
+    insertOp("op-keep-running", "running", 1);
+    insertOp("op-keep-pending", "pending", 1);
     insertOp("op-drop-superseded", "superseded", 1);
     insertOp("op-keep-reconnect", "needs_reconnect", 1);
     insertOp("op-keep-retry", "waiting_retry", 1);
@@ -305,7 +309,7 @@ describe("bookkeeping retention", () => {
       bookings: f.count("bookings"),
       dismissals: f.count("daily_dismissals"),
     };
-    expect(f.engine.cleanupBookkeeping()).toBe(false);
+    expect(f.engine.cleanupBookkeeping().more).toBe(false);
     expect({
       projects: f.count("projects"),
       books: f.count("books"),
@@ -341,16 +345,15 @@ describe("bookkeeping retention", () => {
     expect(ops).toEqual(
       expect.arrayContaining([
         "op-keep-exact",
+        "op-keep-failed",
+        "op-keep-running",
+        "op-keep-pending",
         "op-keep-reconnect",
         "op-keep-retry",
       ]),
     );
     expect(ops).not.toEqual(
-      expect.arrayContaining([
-        "op-drop-old",
-        "op-drop-failed",
-        "op-drop-superseded",
-      ]),
+      expect.arrayContaining(["op-drop-old", "op-drop-superseded"]),
     );
     const pending = f.sql
       .prepare(
@@ -375,20 +378,21 @@ describe("bookkeeping retention", () => {
     ).toEqual(["audit-keep"]);
   });
 
-  it("stops a single pass at the batch cap and reports that more rows remain", () => {
+  it("shares one delete budget across tables and leaves the rest for later", () => {
     const f = fixture();
     f.engine.connectAccount({
       role: "personal",
       email: "owner@example.test",
       encryptedCredentials: "encrypted",
     });
-    const total = CLEANUP_MAX_BATCHES * CLEANUP_BATCH_LIMIT + 1;
-    const insert = f.sql.prepare(
+    const tombstones = 1500;
+    const receipts = 1000;
+    const insertEventRow = f.sql.prepare(
       "INSERT INTO calendar_events(account_id,calendar_id,google_event_id,title,start_utc,end_utc,all_day,is_busy,deleted_at,cached_at) VALUES(?,?,?,?,?,?,0,1,?,?)",
     );
     const id = accountId(f);
-    for (let i = 0; i < total; i++)
-      insert.run(
+    for (let i = 0; i < tombstones; i++)
+      insertEventRow.run(
         id,
         "primary",
         `tomb-${i}`,
@@ -398,8 +402,39 @@ describe("bookkeeping retention", () => {
         NOW,
         NOW,
       );
-    expect(f.engine.cleanupBookkeeping()).toBe(true);
-    expect(f.count("calendar_events")).toBe(1);
+    const insertReceipt = f.sql.prepare(
+      "INSERT INTO command_receipts(id,actor_id,tool,idempotency_key,fingerprint,response_json,committed_at) VALUES(?,?,?,?,?,?,?)",
+    );
+    for (let i = 0; i < receipts; i++)
+      insertReceipt.run(
+        `rcpt-${i}`,
+        "owner",
+        "noop",
+        `rcpt-${i}`,
+        "{}",
+        "{}",
+        1,
+      );
+    f.sql
+      .prepare(
+        "INSERT INTO audit_log(id,actor_id,actor_type,action,entity_ids_json,summary,occurred_at) VALUES(?,?,'human',?,?,?,?)",
+      )
+      .run("audit-later", "owner", "note", "[]", "later", 1);
+    expect(f.engine.cleanupBookkeeping()).toEqual({
+      more: true,
+      deleted: CLEANUP_DAILY_ROW_BUDGET,
+    });
+    expect(f.count("calendar_events")).toBe(0);
+    expect(
+      f.sql
+        .prepare(
+          "SELECT COUNT(*) AS n FROM command_receipts WHERE id LIKE 'rcpt-%'",
+        )
+        .get(),
+    ).toEqual({ n: receipts - (CLEANUP_DAILY_ROW_BUDGET - tombstones) });
+    expect(
+      f.sql.prepare("SELECT id FROM audit_log WHERE id='audit-later'").get(),
+    ).toEqual({ id: "audit-later" });
   });
 
   it("uses the tombstone and terminal-outbox indexes", () => {
@@ -415,7 +450,7 @@ describe("bookkeeping retention", () => {
     const terminal = JSON.stringify(
       f.sql
         .prepare(
-          "EXPLAIN QUERY PLAN SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','failed','superseded') AND updated_at < 1 LIMIT 1",
+          "EXPLAIN QUERY PLAN SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','superseded') AND updated_at < 1 LIMIT 1",
         )
         .all(),
     );
@@ -423,11 +458,19 @@ describe("bookkeeping retention", () => {
     const due = JSON.stringify(
       f.sql
         .prepare(
-          "EXPLAIN QUERY PLAN SELECT MIN(next_attempt_at) AS next FROM outbox_operations WHERE state IN ('pending','waiting_retry')",
+          "EXPLAIN QUERY PLAN SELECT MIN(op.next_attempt_at) AS next FROM outbox_operations op WHERE op.state IN ('pending','waiting_retry')",
         )
         .all(),
     );
     expect(due).toContain("operations_due");
+    const replace = JSON.stringify(
+      f.sql
+        .prepare(
+          "EXPLAIN QUERY PLAN SELECT rowid FROM calendar_events WHERE account_id=? AND calendar_id=? AND all_day=0 AND start_utc<? AND end_utc>?",
+        )
+        .all("account", "primary", 2, 1),
+    );
+    expect(replace).toContain("events_account_span");
   });
 
   it("adds the new indexes to an existing database without rewriting rows", () => {
@@ -476,6 +519,69 @@ describe("bookkeeping retention", () => {
     expect(f.sql.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
   });
 });
+
+function failedCreateThenMove() {
+  const f = fixture();
+  const project = f.apply("queue_project", {
+    title: "Keep me",
+    areaId: "tech",
+  }).data.item;
+  f.apply("start_item", { itemId: project.id });
+  const ticket = f.apply("create_ticket", {
+    projectId: project.id,
+    title: "Task",
+  }).data.ticket;
+  f.engine.connectAccount({
+    role: "personal",
+    email: "owner@example.test",
+    encryptedCredentials: "encrypted",
+  });
+  f.engine.reconcileCalendar({
+    role: "personal",
+    calendarId: "primary",
+    events: [],
+  });
+  const created = f.apply("book_ticket", {
+    ticketId: ticket.id,
+    start: "2026-10-19T08:00:00+02:00",
+    end: "2026-10-19T09:00:00+02:00",
+    allowOverlap: true,
+  });
+  const createId = created.data.effects.operationIds[0] as string;
+  const booking = created.data.booking;
+  expect(f.engine.claimOperation(createId)?.action).toBe("create");
+  f.engine.failOperation(createId, {
+    code: "PROVIDER_UNAVAILABLE",
+    message: "create failed",
+    retryable: false,
+  });
+  const moved = f.apply("move_booking", {
+    bookingId: booking.id,
+    start: "2026-10-19T10:00:00+02:00",
+    end: "2026-10-19T11:00:00+02:00",
+    allowOverlap: true,
+  });
+  const updateId = moved.data.effects.operationIds[0] as string;
+  f.sql
+    .prepare("UPDATE outbox_operations SET updated_at=? WHERE id=?")
+    .run(NOW - OUTBOX_RETENTION_MS - 1, createId);
+  f.sql
+    .prepare(
+      "INSERT INTO outbox_operations(id,actor_id,required_scope,account_id,action,payload_json,state,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,'{}',?,?,?,?)",
+    )
+    .run(
+      "op-drop-succeeded",
+      "owner",
+      "calendar:book",
+      accountId(f),
+      "sync",
+      "succeeded",
+      1,
+      1,
+      NOW - OUTBOX_RETENTION_MS - 1,
+    );
+  return { f, createId, updateId, booking };
+}
 
 describe("alarm read budget", () => {
   it("does not build a snapshot while refreshing a connected calendar", async () => {
@@ -562,5 +668,124 @@ describe("alarm read budget", () => {
     expect(
       f.sql.prepare("SELECT id FROM audit_log WHERE id='old-2'").get(),
     ).toBeUndefined();
+  });
+
+  it("keeps a failed create after purge so the queued move cannot patch an event that was never created", async () => {
+    const { f, createId, updateId, booking } = failedCreateThenMove();
+    expect(f.engine.cleanupBookkeeping().more).toBe(false);
+    expect(
+      f.sql
+        .prepare("SELECT state FROM outbox_operations WHERE id=?")
+        .get(createId),
+    ).toEqual({ state: "failed" });
+    expect(
+      f.sql
+        .prepare(
+          "SELECT id FROM outbox_operations WHERE id='op-drop-succeeded'",
+        )
+        .get(),
+    ).toBeUndefined();
+    expect(f.engine.claimOperation(updateId)).toBeNull();
+    expect(
+      f.engine
+        .snapshot()
+        .operations.find((operation) => operation.id === createId)?.status,
+    ).toBe("failed");
+    const calls: { url: string; method: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({
+          url: String(url),
+          method: (init?.method ?? "GET").toUpperCase(),
+        });
+        return Response.json({ items: [], nextSyncToken: "token" });
+      }),
+    );
+    const { store } = storeFor(f);
+    await store.alarm();
+    expect(
+      calls.filter((call) => call.method === "POST" || call.method === "PATCH"),
+    ).toEqual([]);
+    expect(calls.some((call) => call.url.includes(booking.googleEventId))).toBe(
+      false,
+    );
+    expect(f.engine.claimOperation(updateId)).toBeNull();
+  });
+
+  it("does not re-arm inside the sync interval when the only due operation is held", async () => {
+    const { f, updateId } = failedCreateThenMove();
+    f.engine.cleanupBookkeeping();
+    expect(f.engine.earliestPendingAttempt()).toBeNull();
+    expect(f.engine.dueOperations().map((operation) => operation.id)).toContain(
+      updateId,
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ items: [], nextSyncToken: "token" })),
+    );
+    const { store, alarms } = storeFor(f);
+    const started = Date.now();
+    await store.alarm();
+    await store.alarm();
+    expect(alarms.length).toBeGreaterThan(0);
+    for (const at of alarms) {
+      const delay = at - started;
+      expect(delay).toBeGreaterThanOrEqual(CALENDAR_SYNC_INTERVAL_MS - 1000);
+      expect(delay).toBeGreaterThan(60_000);
+    }
+  });
+
+  it("stops at the daily delete budget and continues the next day without marking cleanup finished", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const total = CLEANUP_DAILY_ROW_BUDGET + 3;
+    const insert = f.sql.prepare(
+      "INSERT INTO calendar_events(account_id,calendar_id,google_event_id,title,start_utc,end_utc,all_day,is_busy,deleted_at,cached_at) VALUES(?,?,?,?,?,?,0,1,?,?)",
+    );
+    const id = accountId(f);
+    const start = NOW - 400 * 24 * 60 * 60 * 1000;
+    for (let i = 0; i < total; i++)
+      insert.run(
+        id,
+        "primary",
+        `tomb-${i}`,
+        "gone",
+        start,
+        start + 60_000,
+        NOW,
+        NOW,
+      );
+    const tombstones = () =>
+      Number(
+        (
+          f.sql
+            .prepare(
+              "SELECT COUNT(*) AS n FROM calendar_events WHERE deleted_at IS NOT NULL",
+            )
+            .get() as { n: number }
+        ).n,
+      );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ items: [], nextSyncToken: "token" })),
+    );
+    const { store, kv } = storeFor(f);
+    await store.alarm();
+    expect(tombstones()).toBe(3);
+    expect(kv.get(CLEANUP_AT_KEY)).toBeUndefined();
+    await store.alarm();
+    expect(tombstones()).toBe(3);
+    kv.set(CLEANUP_PROGRESS_KEY, {
+      startedAt: Date.now() - CLEANUP_INTERVAL_MS - 1,
+      deleted: CLEANUP_DAILY_ROW_BUDGET,
+    });
+    await store.alarm();
+    expect(tombstones()).toBe(0);
+    expect(kv.get(CLEANUP_AT_KEY)).toEqual(expect.any(Number));
   });
 });

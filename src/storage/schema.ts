@@ -27,6 +27,10 @@ export const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS calendar_sources(account_id TEXT NOT NULL REFERENCES calendar_accounts(id), calendar_id TEXT NOT NULL, sync_token TEXT, last_synced_at INTEGER, PRIMARY KEY(account_id,calendar_id))`,
   `CREATE TABLE IF NOT EXISTS calendar_events(account_id TEXT NOT NULL REFERENCES calendar_accounts(id), calendar_id TEXT NOT NULL, google_event_id TEXT NOT NULL, title TEXT NOT NULL, start_utc INTEGER, end_utc INTEGER, all_day INTEGER NOT NULL CHECK(all_day IN (0,1)), start_date TEXT, end_date TEXT, is_busy INTEGER NOT NULL CHECK(is_busy IN (0,1)), etag TEXT, deleted_at INTEGER, cached_at INTEGER NOT NULL, CHECK((all_day=0 AND start_utc IS NOT NULL AND end_utc>start_utc) OR (all_day=1 AND start_date IS NOT NULL AND end_date>start_date)), PRIMARY KEY(account_id,calendar_id,google_event_id))`,
   `CREATE INDEX IF NOT EXISTS events_interval ON calendar_events(start_utc,end_utc)`,
+  // Full-sync replace deletes a time range for one calendar. The account and
+  // interval columns let that delete search instead of scanning the mirror.
+  `CREATE INDEX IF NOT EXISTS events_account_span ON calendar_events(account_id,calendar_id,start_utc,end_utc) WHERE all_day=0`,
+  `CREATE INDEX IF NOT EXISTS events_account_dates ON calendar_events(account_id,calendar_id,start_date,end_date) WHERE all_day=1`,
   // Partial indexes so live-event reads and tombstone purges do not scan the whole mirror.
   `CREATE INDEX IF NOT EXISTS events_active_end ON calendar_events(end_utc) WHERE deleted_at IS NULL AND all_day=0`,
   `CREATE INDEX IF NOT EXISTS events_active_start ON calendar_events(start_utc) WHERE deleted_at IS NULL AND all_day=0`,

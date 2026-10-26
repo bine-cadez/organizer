@@ -24,7 +24,7 @@ import {
   CALENDAR_SYNC_INTERVAL_MS,
   CALENDAR_SYNC_PAST_MS,
   CLEANUP_BATCH_LIMIT,
-  CLEANUP_MAX_BATCHES,
+  CLEANUP_DAILY_ROW_BUDGET,
   OUTBOX_RETENTION_MS,
   RECEIPT_RETENTION_MS,
 } from "./retention";
@@ -136,6 +136,9 @@ const READ_SCOPES: Record<string, string> = {
 };
 const terminal = new Set(["archived", "done"]);
 const inactiveOps = new Set(["succeeded", "failed", "superseded"]);
+/** Earlier rows in these states hold later work on the same booking. claimOperation and earliestPendingAttempt share this list. */
+const BLOCKING_OPERATION_STATES =
+  "('pending','running','waiting_retry','needs_reconnect','failed')";
 const uid = (prefix: string) =>
   prefix + "_" + crypto.randomUUID().replaceAll("-", "");
 const canonical = (v: any): string =>
@@ -3252,12 +3255,19 @@ export class OrganizerEngine {
               endParts.hour === 0 && endParts.minute === 0
                 ? endParts.date
                 : addDays(endParts.date, 1);
+          // Split timed and all-day deletes so each predicate can use its index.
+          // A single OR of the two ranges cannot.
           this.db.run(
-            "DELETE FROM calendar_events WHERE account_id=? AND calendar_id=? AND ((all_day=0 AND start_utc<? AND end_utc>?) OR (all_day=1 AND start_date<? AND end_date>?))",
+            "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE account_id=? AND calendar_id=? AND all_day=0 AND start_utc<? AND end_utc>?)",
             account.id,
             input.calendarId,
             end,
             start,
+          );
+          this.db.run(
+            "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE account_id=? AND calendar_id=? AND all_day=1 AND start_date<? AND end_date>?)",
+            account.id,
+            input.calendarId,
             lastDate,
             firstDate,
           );
@@ -3494,7 +3504,7 @@ export class OrganizerEngine {
         return null;
       if (op.booking_id) {
         const earlier = this.one(
-          "SELECT id FROM outbox_operations WHERE booking_id=? AND rowid<? AND state IN ('pending','running','waiting_retry','needs_reconnect','failed')",
+          `SELECT id FROM outbox_operations WHERE booking_id=? AND rowid<? AND state IN ${BLOCKING_OPERATION_STATES}`,
           op.booking_id,
           op.sequence,
         );
@@ -3631,10 +3641,14 @@ export class OrganizerEngine {
       this.db.run("UPDATE settings SET setup_skipped=1 WHERE id=1"),
     );
   }
-  /** Earliest pending/retry instant, or null when nothing is queued. Uses operations_due. */
+  /**
+   * Earliest pending/retry instant that claimOperation would actually take.
+   * An update held behind an earlier failed or reconnecting op on the same
+   * booking is not due: waking for it spins the alarm without doing work.
+   */
   earliestPendingAttempt(): number | null {
     const row = this.one(
-      "SELECT MIN(next_attempt_at) AS next FROM outbox_operations WHERE state IN ('pending','waiting_retry')",
+      `SELECT MIN(op.next_attempt_at) AS next FROM outbox_operations op WHERE op.state IN ('pending','waiting_retry') AND NOT EXISTS (SELECT 1 FROM outbox_operations earlier WHERE earlier.booking_id=op.booking_id AND op.booking_id IS NOT NULL AND earlier.rowid<op.rowid AND earlier.state IN ${BLOCKING_OPERATION_STATES})`,
     );
     return row?.next == null ? null : Number(row.next);
   }
@@ -3680,60 +3694,73 @@ export class OrganizerEngine {
     };
   }
   /**
-   * Deletes expired calendar-mirror and bookkeeping rows in capped batches.
-   * Projects, books, tickets, learnings, reviews, and bookings are never deleted.
-   * Returns true when a table still had a full batch left, so another day should continue.
+   * Deletes expired calendar-mirror and bookkeeping rows, sharing one row
+   * budget across every table. Projects, books, tickets, learnings, reviews,
+   * and bookings are never deleted. Failed, pending, running, waiting_retry,
+   * and needs_reconnect outbox rows stay so Retry still works and later work
+   * on that booking stays blocked.
+   * `more` means the budget ran out with rows still eligible.
    */
-  cleanupBookkeeping(): boolean {
+  cleanupBookkeeping(limit = CLEANUP_DAILY_ROW_BUDGET): {
+    more: boolean;
+    deleted: number;
+  } {
+    if (limit <= 0) return { more: true, deleted: 0 };
     const now = this.now();
     const past = now - CALENDAR_PAST_RETENTION_MS;
     const future = now + CALENDAR_FUTURE_RETENTION_MS;
     const pastDate = localParts(past).date;
     const futureDate = localParts(future).date;
-    let more = false;
-    const step = (sql: string, ...bindings: any[]) => {
-      if (this.purge(sql, ...bindings)) more = true;
+    let remaining = limit;
+    let deleted = 0;
+    const step = (sql: string, ...bindings: any[]): boolean => {
+      while (remaining > 0) {
+        const batch = Math.min(CLEANUP_BATCH_LIMIT, remaining);
+        const removed = this.db.all(sql, ...bindings, batch);
+        deleted += removed.length;
+        remaining -= removed.length;
+        if (removed.length < batch) return false;
+        if (remaining === 0) return true;
+      }
+      return true;
     };
-    step(
-      "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NOT NULL LIMIT ?) RETURNING rowid",
-    );
-    step(
-      "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND end_utc<=? LIMIT ?) RETURNING rowid",
-      past,
-    );
-    step(
-      "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND start_utc>=? LIMIT ?) RETURNING rowid",
-      future,
-    );
-    step(
-      "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND end_date<=? LIMIT ?) RETURNING rowid",
-      pastDate,
-    );
-    step(
-      "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND start_date>? LIMIT ?) RETURNING rowid",
-      futureDate,
-    );
-    step(
-      "DELETE FROM outbox_operations WHERE rowid IN (SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','failed','superseded') AND updated_at<? LIMIT ?) RETURNING rowid",
-      now - OUTBOX_RETENTION_MS,
-    );
-    step(
-      "DELETE FROM command_receipts WHERE rowid IN (SELECT rowid FROM command_receipts WHERE committed_at<? LIMIT ?) RETURNING rowid",
-      now - RECEIPT_RETENTION_MS,
-    );
-    step(
-      "DELETE FROM audit_log WHERE rowid IN (SELECT rowid FROM audit_log WHERE occurred_at<? LIMIT ?) RETURNING rowid",
-      now - AUDIT_RETENTION_MS,
-    );
-    return more;
-  }
-  private purge(sql: string, ...bindings: any[]): boolean {
-    for (let batch = 0; batch < CLEANUP_MAX_BATCHES; batch++) {
-      const removed = this.db.all(sql, ...bindings, CLEANUP_BATCH_LIMIT);
-      // A short batch means this table is drained. A run of full batches may
-      // have stopped on the cap with rows still left.
-      if (removed.length < CLEANUP_BATCH_LIMIT) return false;
+    const statements: [string, ...any[]][] = [
+      [
+        "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NOT NULL LIMIT ?) RETURNING rowid",
+      ],
+      [
+        "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND end_utc<=? LIMIT ?) RETURNING rowid",
+        past,
+      ],
+      [
+        "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND start_utc>=? LIMIT ?) RETURNING rowid",
+        future,
+      ],
+      [
+        "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND end_date<=? LIMIT ?) RETURNING rowid",
+        pastDate,
+      ],
+      [
+        "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND start_date>? LIMIT ?) RETURNING rowid",
+        futureDate,
+      ],
+      [
+        "DELETE FROM outbox_operations WHERE rowid IN (SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','superseded') AND updated_at<? LIMIT ?) RETURNING rowid",
+        now - OUTBOX_RETENTION_MS,
+      ],
+      [
+        "DELETE FROM command_receipts WHERE rowid IN (SELECT rowid FROM command_receipts WHERE committed_at<? LIMIT ?) RETURNING rowid",
+        now - RECEIPT_RETENTION_MS,
+      ],
+      [
+        "DELETE FROM audit_log WHERE rowid IN (SELECT rowid FROM audit_log WHERE occurred_at<? LIMIT ?) RETURNING rowid",
+        now - AUDIT_RETENTION_MS,
+      ],
+    ];
+    for (const [sql, ...bindings] of statements) {
+      if (remaining <= 0) return { more: true, deleted };
+      if (step(sql, ...bindings)) return { more: true, deleted };
     }
-    return true;
+    return { more: false, deleted };
   }
 }
