@@ -394,10 +394,20 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     failed?: boolean;
     cleanupPending?: boolean;
     claimedNothing?: boolean;
+    /** When this alarm began. Used to tell a row that was already due from one queued while the alarm was awaiting. */
+    alarmStartedAt?: number;
+    /** Recovery alarm this handler just scheduled. A command may have replaced it; that sooner alarm must stay. */
+    ignoreAlarmAt?: number;
   }) {
     this.ensureForeignKeys();
+    const existing = await this.ctx.storage.getAlarm();
+    const keepExisting = (next: number | null) =>
+      existing != null &&
+      existing !== options?.ignoreAlarmAt &&
+      (next == null || existing <= next);
     if (options?.failed) {
-      await this.ctx.storage.setAlarm(Date.now() + ALARM_RECOVERY_MS);
+      const recovery = Date.now() + ALARM_RECOVERY_MS;
+      if (!keepExisting(recovery)) await this.ctx.storage.setAlarm(recovery);
       return;
     }
     const earliest = this.engine.earliestPendingAttempt();
@@ -409,10 +419,17 @@ export class OrganizerStore extends DurableObject<AppEnv> {
             ? Date.now() + CLEANUP_INTERVAL_MS
             : null
         : Math.max(Date.now() + 100, earliest);
-    // Held rows look due but claimOperation skips them. An alarm that took
-    // nothing waits out the sync interval instead of re-arming a few milliseconds ahead.
-    if (options?.claimedNothing && next != null)
+    // An op that was already due when the alarm started, but could not be
+    // claimed, must not spin the handler. A later unheld op keeps its own time.
+    if (
+      options?.claimedNothing &&
+      next != null &&
+      earliest != null &&
+      options.alarmStartedAt != null &&
+      earliest <= options.alarmStartedAt
+    )
       next = Math.max(next, Date.now() + CALENDAR_SYNC_INTERVAL_MS);
+    if (keepExisting(next)) return;
     if (next == null) await this.ctx.storage.deleteAlarm();
     else await this.ctx.storage.setAlarm(next);
   }
@@ -444,9 +461,12 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     this.ensureForeignKeys();
     // Schedule recovery before doing work. Platform alarm retries are finite;
     // a rows_read failure must still leave a later alarm, and not a tight loop.
+    const alarmStartedAt = Date.now();
     let scheduled = false;
+    let recoveryAt: number | undefined;
     try {
-      await this.ctx.storage.setAlarm(Date.now() + ALARM_RECOVERY_MS);
+      recoveryAt = alarmStartedAt + ALARM_RECOVERY_MS;
+      await this.ctx.storage.setAlarm(recoveryAt);
       scheduled = true;
     } catch (error) {
       console.error(
@@ -615,6 +635,8 @@ export class OrganizerStore extends DurableObject<AppEnv> {
         failed,
         cleanupPending,
         claimedNothing: claimed === 0,
+        alarmStartedAt,
+        ignoreAlarmAt: recoveryAt,
       });
     } catch (error) {
       console.error(

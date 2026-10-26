@@ -92,15 +92,19 @@ function storeFor(f: ReturnType<typeof fixture>) {
   const kv = new Map<string, unknown>();
   const alarms: number[] = [];
   let deletedAlarm = 0;
+  let currentAlarm: number | null = null;
   store.engine = f.engine;
   store.syncing = new Map();
   store.refreshing = new Map();
   store.ctx = {
     storage: {
       setAlarm: async (at: number) => {
+        currentAlarm = at;
         alarms.push(at);
       },
+      getAlarm: async () => currentAlarm,
       deleteAlarm: async () => {
+        currentAlarm = null;
         deletedAlarm += 1;
       },
       kv: {
@@ -713,6 +717,35 @@ describe("alarm read budget", () => {
     expect(f.engine.claimOperation(updateId)).toBeNull();
   });
 
+  it("reports the purge finished when the budget ends on the last eligible row", () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const insert = f.sql.prepare(
+      "INSERT INTO calendar_events(account_id,calendar_id,google_event_id,title,start_utc,end_utc,all_day,is_busy,deleted_at,cached_at) VALUES(?,?,?,?,?,?,0,1,?,?)",
+    );
+    const id = accountId(f);
+    for (let i = 0; i < CLEANUP_DAILY_ROW_BUDGET; i++)
+      insert.run(
+        id,
+        "primary",
+        `tomb-${i}`,
+        "gone",
+        NOW,
+        NOW + 60_000,
+        NOW,
+        NOW,
+      );
+    expect(f.engine.cleanupBookkeeping()).toEqual({
+      more: false,
+      deleted: CLEANUP_DAILY_ROW_BUDGET,
+    });
+    expect(f.count("calendar_events")).toBe(0);
+  });
+
   it("does not re-arm inside the sync interval when the only due operation is held", async () => {
     const { f, updateId } = failedCreateThenMove();
     f.engine.cleanupBookkeeping();
@@ -787,5 +820,115 @@ describe("alarm read budget", () => {
     await store.alarm();
     expect(tombstones()).toBe(0);
     expect(kv.get(CLEANUP_AT_KEY)).toEqual(expect.any(Number));
+  });
+
+  it("keeps a booking alarm queued during an in-flight sync", async () => {
+    const f = fixture();
+    const project = f.apply("queue_project", {
+      title: "Keep me",
+      areaId: "tech",
+    }).data.item;
+    f.apply("start_item", { itemId: project.id });
+    const ticket = f.apply("create_ticket", {
+      projectId: project.id,
+      title: "Task",
+    }).data.ticket;
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    // Source freshness lets the booking skip its own sync. The account is still
+    // due, so the alarm's fetch stays in flight while the booking is queued.
+    const { store, alarms, kv } = storeFor(f);
+    kv.set(`calendar-profile:${accountId(f)}:primary`, {
+      start: "2026-10-27T00:00:00.000Z",
+      end: "2026-10-28T00:00:00.000Z",
+    });
+    f.sql
+      .prepare("UPDATE calendar_sources SET last_synced_at=?")
+      .run(Date.now());
+    f.sql
+      .prepare(
+        "UPDATE calendar_accounts SET last_synced_at=0 WHERE role='personal'",
+      )
+      .run();
+    let calls = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        calls += 1;
+        if (calls === 1) await gate;
+        return Response.json({ items: [], nextSyncToken: "token" });
+      }),
+    );
+    const running = store.alarm();
+    await vi.waitFor(() => expect(calls).toBe(1));
+    // The booking is queued after the alarm started, so its attempt time is later than alarmStartedAt.
+    f.setTime(Date.now());
+    const booked = await store.execute(
+      "book_ticket",
+      {
+        ticketId: ticket.id,
+        start: "2026-10-27T10:00:00+01:00",
+        end: "2026-10-27T11:00:00+01:00",
+        allowOverlap: true,
+        idempotencyKey: "book-during-sync",
+        expectedVersions: f.engine.snapshot().versions,
+        acceptIncompleteAvailability: true,
+      },
+      actor,
+    );
+    expect(booked.error).toBeUndefined();
+    const prompt = alarms.at(-1)!;
+    const bookedAt = Date.now();
+    expect(prompt).toBeLessThanOrEqual(bookedAt + 1000);
+    expect(bookedAt - prompt).toBeLessThan(5_000);
+    release();
+    await running;
+    expect(await store.ctx.storage.getAlarm()).toBe(prompt);
+    expect(alarms.at(-1)).toBe(prompt);
+    expect(prompt - bookedAt).toBeGreaterThan(-5_000);
+    expect(Math.abs(prompt - bookedAt)).toBeLessThan(
+      CALENDAR_SYNC_INTERVAL_MS / 2,
+    );
+  });
+
+  it("arms a waiting retry that becomes due after the alarm started", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const due = Date.now() + 1000;
+    f.sql
+      .prepare(
+        "INSERT INTO outbox_operations(id,actor_id,required_scope,account_id,action,payload_json,state,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,'{}','waiting_retry',?,?,?)",
+      )
+      .run(
+        "op-retry-soon",
+        "owner",
+        "calendar:book",
+        accountId(f),
+        "sync",
+        due,
+        due,
+        due,
+      );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ items: [], nextSyncToken: "token" })),
+    );
+    const { store } = storeFor(f);
+    await store.alarm();
+    const alarmAt = await store.ctx.storage.getAlarm();
+    expect(alarmAt).toBe(due);
+    expect(alarmAt - Date.now()).toBeLessThan(5_000);
+    expect(alarmAt - Date.now()).toBeGreaterThan(0);
   });
 });

@@ -3713,53 +3713,71 @@ export class OrganizerEngine {
     const futureDate = localParts(future).date;
     let remaining = limit;
     let deleted = 0;
-    const step = (sql: string, ...bindings: any[]): boolean => {
+    const statements: { sql: string; probe: string; bindings: any[] }[] = [
+      {
+        sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NOT NULL LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM calendar_events WHERE deleted_at IS NOT NULL LIMIT 1",
+        bindings: [],
+      },
+      {
+        sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND end_utc<=? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND end_utc<=? LIMIT 1",
+        bindings: [past],
+      },
+      {
+        sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND start_utc>=? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND start_utc>=? LIMIT 1",
+        bindings: [future],
+      },
+      {
+        sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND end_date<=? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND end_date<=? LIMIT 1",
+        bindings: [pastDate],
+      },
+      {
+        sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND start_date>? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND start_date>? LIMIT 1",
+        bindings: [futureDate],
+      },
+      {
+        sql: "DELETE FROM outbox_operations WHERE rowid IN (SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','superseded') AND updated_at<? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','superseded') AND updated_at<? LIMIT 1",
+        bindings: [now - OUTBOX_RETENTION_MS],
+      },
+      {
+        sql: "DELETE FROM command_receipts WHERE rowid IN (SELECT rowid FROM command_receipts WHERE committed_at<? LIMIT ?) RETURNING rowid",
+        probe:
+          "SELECT rowid FROM command_receipts WHERE committed_at<? LIMIT 1",
+        bindings: [now - RECEIPT_RETENTION_MS],
+      },
+      {
+        sql: "DELETE FROM audit_log WHERE rowid IN (SELECT rowid FROM audit_log WHERE occurred_at<? LIMIT ?) RETURNING rowid",
+        probe: "SELECT rowid FROM audit_log WHERE occurred_at<? LIMIT 1",
+        bindings: [now - AUDIT_RETENTION_MS],
+      },
+    ];
+    const stillEligible = (probe: string, bindings: any[]) =>
+      this.db.all(probe, ...bindings).length > 0;
+    for (const { sql, probe, bindings } of statements) {
+      if (remaining <= 0) {
+        if (stillEligible(probe, bindings)) return { more: true, deleted };
+        continue;
+      }
       while (remaining > 0) {
         const batch = Math.min(CLEANUP_BATCH_LIMIT, remaining);
         const removed = this.db.all(sql, ...bindings, batch);
         deleted += removed.length;
         remaining -= removed.length;
-        if (removed.length < batch) return false;
-        if (remaining === 0) return true;
+        if (removed.length < batch) break;
+        if (remaining === 0 && stillEligible(probe, bindings))
+          return { more: true, deleted };
       }
-      return true;
-    };
-    const statements: [string, ...any[]][] = [
-      [
-        "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NOT NULL LIMIT ?) RETURNING rowid",
-      ],
-      [
-        "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND end_utc<=? LIMIT ?) RETURNING rowid",
-        past,
-      ],
-      [
-        "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND start_utc>=? LIMIT ?) RETURNING rowid",
-        future,
-      ],
-      [
-        "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND end_date<=? LIMIT ?) RETURNING rowid",
-        pastDate,
-      ],
-      [
-        "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND start_date>? LIMIT ?) RETURNING rowid",
-        futureDate,
-      ],
-      [
-        "DELETE FROM outbox_operations WHERE rowid IN (SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','superseded') AND updated_at<? LIMIT ?) RETURNING rowid",
-        now - OUTBOX_RETENTION_MS,
-      ],
-      [
-        "DELETE FROM command_receipts WHERE rowid IN (SELECT rowid FROM command_receipts WHERE committed_at<? LIMIT ?) RETURNING rowid",
-        now - RECEIPT_RETENTION_MS,
-      ],
-      [
-        "DELETE FROM audit_log WHERE rowid IN (SELECT rowid FROM audit_log WHERE occurred_at<? LIMIT ?) RETURNING rowid",
-        now - AUDIT_RETENTION_MS,
-      ],
-    ];
-    for (const [sql, ...bindings] of statements) {
-      if (remaining <= 0) return { more: true, deleted };
-      if (step(sql, ...bindings)) return { more: true, deleted };
     }
     return { more: false, deleted };
   }

@@ -105,6 +105,7 @@ function storeFor(engine: OrganizerEngine) {
   store.ctx = {
     storage: {
       setAlarm: async () => {},
+      getAlarm: async () => null,
       deleteAlarm: async () => {},
       kv: {
         get: (key: string) => kv.get(key),
@@ -944,7 +945,13 @@ describe("persisted Organizer domain", () => {
       vi.stubGlobal("fetch", fetcher);
       const store = Object.create(OrganizerStore.prototype) as any;
       store.engine = f.engine;
-      store.ctx = { storage: { setAlarm: async () => {} } };
+      store.ctx = {
+        storage: {
+          setAlarm: async () => {},
+          getAlarm: async () => null,
+          deleteAlarm: async () => {},
+        },
+      };
       store.env = {};
       store.credentials = async () => ({
         accessToken: "test-token",
@@ -997,7 +1004,13 @@ describe("persisted Organizer domain", () => {
     vi.stubGlobal("fetch", fetcher);
     const store = Object.create(OrganizerStore.prototype) as any;
     store.engine = f.engine;
-    store.ctx = { storage: { setAlarm: async () => {} } };
+    store.ctx = {
+      storage: {
+        setAlarm: async () => {},
+        getAlarm: async () => null,
+        deleteAlarm: async () => {},
+      },
+    };
     store.env = {};
     store.credentials = async () => ({
       accessToken: "test-token",
