@@ -109,7 +109,7 @@ describe("workerd books migration", () => {
         server,
         "SELECT version FROM schema_versions ORDER BY version",
       ),
-    ).toEqual([{ version: 1 }, { version: 2 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
     expect(
       await rows(server, "SELECT id, book_id FROM queue_entries ORDER BY id"),
     ).toEqual([
@@ -135,7 +135,7 @@ describe("workerd books migration", () => {
         server,
         "SELECT version FROM schema_versions ORDER BY version",
       ),
-    ).toEqual([{ version: 1 }, { version: 2 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
     expect(await rows(server, "SELECT COUNT(*) AS n FROM books")).toEqual([
       { n: 3 },
     ]);
@@ -197,9 +197,7 @@ describe("workerd books migration", () => {
       await rows(server, "SELECT id FROM queue_entries WHERE id='queue_bad'"),
     ).toEqual([]);
     expect(await rows(server, "PRAGMA foreign_key_check")).toEqual([]);
-    expect(
-      await rows(server, "SELECT id FROM books ORDER BY id"),
-    ).toEqual([
+    expect(await rows(server, "SELECT id FROM books ORDER BY id")).toEqual([
       { id: "book_meditations" },
       { id: "book_mom" },
       { id: "book_odyssey" },

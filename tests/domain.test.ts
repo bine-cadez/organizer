@@ -105,6 +105,7 @@ function storeFor(engine: OrganizerEngine) {
   store.ctx = {
     storage: {
       setAlarm: async () => {},
+      deleteAlarm: async () => {},
       kv: {
         get: (key: string) => kv.get(key),
         put: (key: string, value: unknown) => kv.set(key, value),

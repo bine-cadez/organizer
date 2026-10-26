@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { CALENDAR_SYNC_INTERVAL_MS } from "../domain/retention";
 import type { Ticket } from "../shared/types";
 import {
   addDays,
@@ -128,7 +129,8 @@ export function ConnectionNotes() {
         if (connection?.status === "connected") {
           const stale =
             connection.lastSyncedAt &&
-            Date.now() - Date.parse(connection.lastSyncedAt) > 300000;
+            Date.now() - Date.parse(connection.lastSyncedAt) >
+              CALENDAR_SYNC_INTERVAL_MS;
           return stale ? (
             <p key={role}>
               {role === "personal" ? "Personal" : "Work"} calendar last updated{" "}
@@ -181,7 +183,7 @@ export function Calendar() {
         });
     safe(sync());
     window.addEventListener("focus", sync);
-    const timer = window.setInterval(sync, 300000);
+    const timer = window.setInterval(sync, CALENDAR_SYNC_INTERVAL_MS);
     return () => {
       active = false;
       clearInterval(timer);
@@ -647,7 +649,7 @@ export function BookTime({
     (c) =>
       c.status !== "connected" ||
       !c.lastSyncedAt ||
-      Date.now() - Date.parse(c.lastSyncedAt) > 300000,
+      Date.now() - Date.parse(c.lastSyncedAt) > CALENDAR_SYNC_INTERVAL_MS,
   );
   const startMinutes =
     Number(start.split(":")[0]) * 60 + Number(start.split(":")[1]);

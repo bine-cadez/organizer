@@ -16,6 +16,12 @@ import { decryptSecret, encryptSecret } from "../integrations/crypto";
 import type { Actor, CalendarRole } from "../shared/types";
 import type { AppEnv } from "../worker/env";
 import { addDays, dayBounds } from "../domain/time";
+import {
+  ALARM_RECOVERY_MS,
+  CALENDAR_SYNC_INTERVAL_MS,
+  CLEANUP_AT_KEY,
+  CLEANUP_INTERVAL_MS,
+} from "../domain/retention";
 
 type CalendarRange = { start: string; end: string };
 
@@ -144,7 +150,8 @@ export class OrganizerStore extends DurableObject<AppEnv> {
           Date.parse(profile.start) <= Date.parse(range.start) &&
           Date.parse(profile.end) >= Date.parse(range.end) &&
           source.lastSyncedAt &&
-          Date.now() - Date.parse(source.lastSyncedAt) <= 300000
+          Date.now() - Date.parse(source.lastSyncedAt) <=
+            CALENDAR_SYNC_INTERVAL_MS
         );
       }),
     );
@@ -307,19 +314,7 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     role: CalendarRole,
     range?: CalendarRange,
   ): Promise<void> {
-    const day = this.engine.snapshot().localDate;
-    const requested = range || {
-      start: new Date(
-        Date.parse(`${day}T00:00:00Z`) - 7 * 86400000,
-      ).toISOString(),
-      end: new Date(
-        Date.parse(`${day}T00:00:00Z`) + 28 * 86400000,
-      ).toISOString(),
-    };
-    const baseline = {
-      start: new Date(requested.start).toISOString(),
-      end: new Date(requested.end).toISOString(),
-    };
+    const baseline = this.engine.syncWindow(range);
     const key = `${role}:${baseline.start}:${baseline.end}`;
     const current = this.syncing.get(key);
     if (current) return current;
@@ -362,24 +357,14 @@ export class OrganizerStore extends DurableObject<AppEnv> {
         const events = result.events.map(projectEvent);
         if (full) {
           const ids = new Set(result.events.map((event) => event.id));
-          for (const booking of this.engine
-            .snapshot()
-            .bookings.filter(
-              (b) =>
-                b.accountId === account.id &&
-                b.calendarId === source.calendarId &&
-                b.desiredPresence === "present" &&
-                (b.syncState === "synced" || b.remoteStart) &&
-                !ids.has(b.googleEventId),
-            )) {
-            const observed = await google.get(
-              source.calendarId,
-              booking.googleEventId,
-            );
+          for (const googleEventId of this.engine
+            .presentBookingEventIds(account.id, source.calendarId)
+            .filter((id) => !ids.has(id))) {
+            const observed = await google.get(source.calendarId, googleEventId);
             events.push(
               observed
                 ? projectEvent(observed)
-                : { googleEventId: booking.googleEventId, deleted: true },
+                : { googleEventId, deleted: true },
             );
           }
         }
@@ -402,33 +387,58 @@ export class OrganizerStore extends DurableObject<AppEnv> {
       this.syncing.delete(key);
     }
   }
-  private async arm() {
-    const snapshot = this.engine.snapshot();
-    const jobs = snapshot.operations.filter((op) =>
-      ["pending", "waiting_retry"].includes(op.status),
-    );
-    const next = jobs.length
-      ? Math.max(
-          Date.now() + 100,
-          Math.min(
-            ...jobs.map((op) =>
-              op.nextAttemptAt ? Date.parse(op.nextAttemptAt) : Date.now(),
-            ),
-          ),
-        )
-      : snapshot.connections.some((c) => c.status === "connected")
-        ? Date.now() + 300000
-        : null;
-    if (next !== null) {
-      this.ensureForeignKeys();
-      await this.ctx.storage.setAlarm(next);
+  private async arm(options?: { failed?: boolean; cleanupPending?: boolean }) {
+    this.ensureForeignKeys();
+    if (options?.failed) {
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_RECOVERY_MS);
+      return;
     }
+    const earliest = this.engine.earliestPendingAttempt();
+    const next =
+      earliest == null
+        ? this.engine.hasConnectedCalendar()
+          ? Date.now() + CALENDAR_SYNC_INTERVAL_MS
+          : options?.cleanupPending
+            ? Date.now() + CLEANUP_INTERVAL_MS
+            : null
+        : Math.max(Date.now() + 100, earliest);
+    if (next == null) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(next);
+  }
+  private cleanupIfDue(): boolean {
+    const last = this.ctx.storage.kv.get<number>(CLEANUP_AT_KEY) ?? 0;
+    if (Date.now() - last < CLEANUP_INTERVAL_MS) return false;
+    const more = this.engine.cleanupBookkeeping();
+    this.ctx.storage.kv.put(CLEANUP_AT_KEY, Date.now());
+    return more;
   }
   async alarm() {
     // setAlarm writes. On workerd that opens the event's implicit transaction
     // and every later PRAGMA foreign_keys=ON is ignored, so re-enable first.
     this.ensureForeignKeys();
-    await this.ctx.storage.setAlarm(Date.now() + 60000);
+    // Schedule recovery before doing work. Platform alarm retries are finite;
+    // a rows_read failure must still leave a later alarm, and not a tight loop.
+    let scheduled = false;
+    try {
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_RECOVERY_MS);
+      scheduled = true;
+    } catch (error) {
+      console.error(
+        "organizer alarm could not schedule recovery",
+        error instanceof Error ? error.message : error,
+      );
+    }
+    let failed = false;
+    let cleanupPending = false;
+    try {
+      cleanupPending = this.cleanupIfDue();
+    } catch (error) {
+      failed = true;
+      console.error(
+        "organizer cleanup failed",
+        error instanceof Error ? error.message : error,
+      );
+    }
     try {
       for (const operation of this.engine.dueOperations(10)) {
         const work = this.engine.claimOperation(operation.id);
@@ -553,23 +563,33 @@ export class OrganizerStore extends DurableObject<AppEnv> {
           });
         }
       }
-      for (const connection of this.engine
-        .snapshot()
-        .connections.filter(
-          (c) =>
-            c.status === "connected" &&
-            (!c.lastSyncedAt ||
-              Date.now() - Date.parse(c.lastSyncedAt) >= 300000),
-        )) {
+      for (const role of this.engine.connectionsDueForSync(
+        Date.now() - CALENDAR_SYNC_INTERVAL_MS,
+      )) {
         try {
-          await this.synchronize(connection.role);
+          await this.synchronize(role);
         } catch (error) {
-          if (error instanceof CalendarProviderError && error.needsReconnect)
-            this.engine.setAccountStatus(connection.role, "needs_reconnect");
+          if (error instanceof CalendarProviderError) {
+            if (error.needsReconnect)
+              this.engine.setAccountStatus(role, "needs_reconnect");
+          } else throw error;
         }
       }
-    } finally {
-      await this.arm();
+    } catch (error) {
+      failed = true;
+      console.error(
+        "organizer alarm failed",
+        error instanceof Error ? error.message : error,
+      );
+    }
+    try {
+      await this.arm({ failed, cleanupPending });
+    } catch (error) {
+      console.error(
+        "organizer alarm could not reschedule",
+        error instanceof Error ? error.message : error,
+      );
+      if (!scheduled) throw error;
     }
   }
 }

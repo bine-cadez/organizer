@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { CALENDAR_SYNC_INTERVAL_MS } from "../domain/retention";
 import type { AreaId, Item, Ticket, TicketStatus } from "../shared/types";
 import { useApp } from "./context";
 import {
@@ -332,7 +333,7 @@ export function Today() {
         .catch(() => undefined);
     safe(sync());
     window.addEventListener("focus", sync);
-    const timer = window.setInterval(sync, 300000);
+    const timer = window.setInterval(sync, CALENDAR_SYNC_INTERVAL_MS);
     return () => {
       active = false;
       clearInterval(timer);
