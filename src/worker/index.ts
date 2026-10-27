@@ -22,6 +22,7 @@ import {
   requireBrowserWrite,
   type Session,
 } from "./auth";
+import { touchOrganizerAlarm } from "./alarm";
 import type { AppEnv } from "./env";
 
 export { OrganizerStore };
@@ -99,6 +100,9 @@ async function contextFor(
   ownerSub: string,
 ): Promise<McpContext> {
   const store = env.ORGANIZER.getByName(ownerSub);
+  // Tool listing and token traffic never call the object. This does, at most
+  // once a minute, so a dropped alarm is armed again on ordinary /mcp use.
+  await touchOrganizerAlarm(ownerSub, () => store.ensureAlarm());
   const contact = env.CONTACT_EMAIL || env.OWNER_EMAIL;
   const catalog = new BookCatalog(env.OAUTH_KV, contact, fetch, async () => {
     const delay = await store.catalogPermit(Boolean(contact));
