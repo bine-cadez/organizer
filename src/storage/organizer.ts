@@ -17,6 +17,8 @@ import type { Actor, CalendarRole } from "../shared/types";
 import type { AppEnv } from "../worker/env";
 import { addDays, dayBounds } from "../domain/time";
 import {
+  ALARM_ENSURE_INTERVAL_MS,
+  ALARM_RECOVERY_MAX_MS,
   ALARM_RECOVERY_MS,
   CALENDAR_SYNC_INTERVAL_MS,
   CLEANUP_AT_KEY,
@@ -38,6 +40,8 @@ export class OrganizerStore extends DurableObject<AppEnv> {
   // the engine migrates so this retry does not undo the rebuild.
   private schemaReady = false;
   private foreignKeysOn = false;
+  /** Skip schedule reads briefly after confirming there is nothing to arm. */
+  private nextIdleAlarmProbeAt = 0;
   constructor(ctx: DurableObjectState, env: AppEnv) {
     super(ctx, env);
     const db: DbPort = {
@@ -57,6 +61,9 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     this.engine = new OrganizerEngine(db);
     this.schemaReady = true;
     this.ensureForeignKeys();
+    // Any wake (request or alarm) re-arms a platform-dropped alarm before
+    // other work. getAlarm() is metadata; arm() runs only when it is missing.
+    ctx.blockConcurrencyWhile(() => this.ensureAlarm());
   }
   private ensureForeignKeys() {
     if (!this.schemaReady || this.foreignKeysOn) return;
@@ -67,7 +74,8 @@ export class OrganizerStore extends DurableObject<AppEnv> {
           ?.foreign_keys,
       ) === 1;
   }
-  snapshot() {
+  async snapshot() {
+    await this.ensureAlarm();
     this.ensureForeignKeys();
     return this.engine.snapshot();
   }
@@ -160,6 +168,7 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     );
   }
   async execute(name: string, args: Record<string, unknown>, actor: Actor) {
+    await this.ensureAlarm();
     this.ensureForeignKeys();
     try {
       const replay = this.engine.replayReceipt(name, args, actor);
@@ -251,6 +260,7 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     }
   }
   async skipSetup() {
+    await this.ensureAlarm();
     this.ensureForeignKeys();
     this.engine.skipSetup();
     return this.engine.snapshot();
@@ -258,10 +268,15 @@ export class OrganizerStore extends DurableObject<AppEnv> {
   async connectAccount(input: AccountInput) {
     this.ensureForeignKeys();
     const result = this.engine.connectAccount(input);
-    await this.ctx.storage.setAlarm(Date.now() + 100);
+    // Sync immediately after a connect, but do not delay an earlier alarm.
+    const soon = Date.now() + 100;
+    const existing = await this.ctx.storage.getAlarm();
+    if (existing == null || existing > soon)
+      await this.ctx.storage.setAlarm(soon);
     return result;
   }
   async catalogPermit(identified: boolean): Promise<number> {
+    await this.ensureAlarm();
     this.ensureForeignKeys();
     const now = Date.now(),
       previous = this.ctx.storage.kv.get<number>("catalog:next") || 0;
@@ -390,6 +405,49 @@ export class OrganizerStore extends DurableObject<AppEnv> {
       this.syncing.delete(key);
     }
   }
+  /**
+   * Restore a platform-dropped alarm. getAlarm() does not read SQL rows.
+   * Schedule reads run only when no alarm is set, and an earlier alarm is
+   * left where it is.
+   */
+  async ensureAlarm(): Promise<void> {
+    try {
+      const existing = await this.ctx.storage.getAlarm();
+      if (existing != null) {
+        this.nextIdleAlarmProbeAt = 0;
+        return;
+      }
+      if (Date.now() < this.nextIdleAlarmProbeAt) return;
+      await this.arm();
+      if ((await this.ctx.storage.getAlarm()) == null)
+        this.nextIdleAlarmProbeAt = Date.now() + ALARM_ENSURE_INTERVAL_MS;
+      else {
+        this.nextIdleAlarmProbeAt = 0;
+        console.log(JSON.stringify({ event: "alarm_rearmed" }));
+      }
+    } catch (error) {
+      console.error(
+        "organizer alarm ensure failed",
+        error instanceof Error ? error.message : error,
+      );
+      try {
+        const again = await this.ctx.storage.getAlarm();
+        // A future alarm at least a minute out is not a hot loop. Anything
+        // sooner, or nothing, is replaced with the recovery backoff.
+        if (again != null && again > Date.now() + ALARM_ENSURE_INTERVAL_MS)
+          return;
+        await this.ctx.storage.setAlarm(Date.now() + ALARM_RECOVERY_MS);
+        console.log(JSON.stringify({ event: "alarm_rearmed" }));
+      } catch (scheduleError) {
+        console.error(
+          "organizer alarm ensure could not schedule",
+          scheduleError instanceof Error
+            ? scheduleError.message
+            : scheduleError,
+        );
+      }
+    }
+  }
   private async arm(options?: {
     failed?: boolean;
     cleanupPending?: boolean;
@@ -398,18 +456,26 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     alarmStartedAt?: number;
     /** Recovery alarm this handler just scheduled. A command may have replaced it; that sooner alarm must stay. */
     ignoreAlarmAt?: number;
+    /** Failure backoff chosen for this attempt. Never below 15 minutes. */
+    recoveryMs?: number;
   }) {
+    if (options?.failed) {
+      // The daily rows-read limit outlives a short retry. Keeping a sooner
+      // alarm would run this handler again immediately, so failure always
+      // waits out the backoff. Success still refuses to delay an earlier alarm.
+      const delay = Math.min(
+        ALARM_RECOVERY_MAX_MS,
+        Math.max(ALARM_RECOVERY_MS, options.recoveryMs ?? ALARM_RECOVERY_MS),
+      );
+      await this.ctx.storage.setAlarm(Date.now() + delay);
+      return;
+    }
     this.ensureForeignKeys();
     const existing = await this.ctx.storage.getAlarm();
     const keepExisting = (next: number | null) =>
       existing != null &&
       existing !== options?.ignoreAlarmAt &&
       (next == null || existing <= next);
-    if (options?.failed) {
-      const recovery = Date.now() + ALARM_RECOVERY_MS;
-      if (!keepExisting(recovery)) await this.ctx.storage.setAlarm(recovery);
-      return;
-    }
     const earliest = this.engine.earliestPendingAttempt();
     let next =
       earliest == null
@@ -430,8 +496,16 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     )
       next = Math.max(next, Date.now() + CALENDAR_SYNC_INTERVAL_MS);
     if (keepExisting(next)) return;
-    if (next == null) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(next);
+    if (next == null) {
+      if (existing != null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    await this.ctx.storage.setAlarm(next);
+  }
+  /** Failure backoff: 15 minutes, plus 15 per platform retry, capped at an hour. */
+  private recoveryDelay(attempt = 0) {
+    const steps = Math.min(Math.max(0, attempt), 3);
+    return Math.min(ALARM_RECOVERY_MAX_MS, ALARM_RECOVERY_MS * (steps + 1));
   }
   private cleanupIfDue(): boolean {
     const now = Date.now();
@@ -455,17 +529,27 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     if (!result.more) this.ctx.storage.kv.put(CLEANUP_AT_KEY, now);
     return result.more;
   }
-  async alarm() {
+  async alarm(alarmInfo?: AlarmInvocationInfo) {
     // setAlarm writes. On workerd that opens the event's implicit transaction
     // and every later PRAGMA foreign_keys=ON is ignored, so re-enable first.
-    this.ensureForeignKeys();
-    // Schedule recovery before doing work. Platform alarm retries are finite;
-    // a rows_read failure must still leave a later alarm, and not a tight loop.
+    // A rows-read failure here must not skip scheduling.
+    try {
+      this.ensureForeignKeys();
+    } catch (error) {
+      console.error(
+        "organizer alarm could not enable foreign keys",
+        error instanceof Error ? error.message : error,
+      );
+    }
+    // Schedule recovery before doing work. Platform retries are finite and
+    // start at about two seconds; once they are exhausted the alarm is gone.
+    // Returning after setAlarm commits the next run instead of rethrowing.
     const alarmStartedAt = Date.now();
+    const recoveryMs = this.recoveryDelay(alarmInfo?.retryCount ?? 0);
     let scheduled = false;
     let recoveryAt: number | undefined;
     try {
-      recoveryAt = alarmStartedAt + ALARM_RECOVERY_MS;
+      recoveryAt = alarmStartedAt + recoveryMs;
       await this.ctx.storage.setAlarm(recoveryAt);
       scheduled = true;
     } catch (error) {
@@ -637,13 +721,29 @@ export class OrganizerStore extends DurableObject<AppEnv> {
         claimedNothing: claimed === 0,
         alarmStartedAt,
         ignoreAlarmAt: recoveryAt,
+        recoveryMs,
       });
     } catch (error) {
       console.error(
         "organizer alarm could not reschedule",
         error instanceof Error ? error.message : error,
       );
-      if (!scheduled) throw error;
+      if (scheduled) return;
+      // Opening setAlarm failed and the reschedule read failed too. One more
+      // metadata write, then rethrow only if that also fails so the platform
+      // can retry. A successful write must not rethrow: platform retries are
+      // a few seconds apart and then the alarm is deleted.
+      try {
+        await this.ctx.storage.setAlarm(Date.now() + recoveryMs);
+      } catch (scheduleError) {
+        console.error(
+          "organizer alarm could not schedule recovery",
+          scheduleError instanceof Error
+            ? scheduleError.message
+            : scheduleError,
+        );
+        throw scheduleError;
+      }
     }
   }
 }

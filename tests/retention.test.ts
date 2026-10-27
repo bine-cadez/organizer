@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OrganizerEngine, type DbPort } from "../src/domain/engine";
 import {
+  ALARM_RECOVERY_MAX_MS,
   ALARM_RECOVERY_MS,
   AUDIT_RETENTION_MS,
   CALENDAR_FUTURE_RETENTION_MS,
@@ -16,7 +17,16 @@ import {
 } from "../src/domain/retention";
 import { localParts } from "../src/domain/time";
 import { ALL_SCOPES, type Actor } from "../src/shared/types";
-vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
+vi.mock("cloudflare:workers", () => ({
+  DurableObject: class {
+    ctx: unknown;
+    env: unknown;
+    constructor(ctx: unknown, env: unknown) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  },
+}));
 import { OrganizerStore } from "../src/storage/organizer";
 
 const actor: Actor = { id: "owner", type: "human", scopes: ALL_SCOPES };
@@ -840,6 +850,12 @@ describe("alarm read budget", () => {
     });
     // Source freshness lets the booking skip its own sync. The account is still
     // due, so the alarm's fetch stays in flight while the booking is queued.
+    // Pin the clock before 10:00 local so the slot stays in the future whenever
+    // this file runs.
+    const pinned = Date.parse("2026-10-27T08:00:00+01:00");
+    const realNow = Date.now.bind(Date);
+    const mark = realNow();
+    vi.spyOn(Date, "now").mockImplementation(() => pinned + (realNow() - mark));
     const { store, alarms, kv } = storeFor(f);
     kv.set(`calendar-profile:${accountId(f)}:primary`, {
       start: "2026-10-27T00:00:00.000Z",
@@ -930,5 +946,175 @@ describe("alarm read budget", () => {
     expect(alarmAt).toBe(due);
     expect(alarmAt - Date.now()).toBeLessThan(5_000);
     expect(alarmAt - Date.now()).toBeGreaterThan(0);
+  });
+
+  it("re-arms a missing alarm on the first request without moving an earlier one later", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const { store, alarms } = storeFor(f);
+    const started = Date.now();
+    await store.snapshot();
+    const armed = await store.ctx.storage.getAlarm();
+    expect(armed).not.toBeNull();
+    expect(armed! - started).toBeGreaterThanOrEqual(
+      CALENDAR_SYNC_INTERVAL_MS - 1000,
+    );
+    expect(armed! - started).toBeLessThanOrEqual(
+      CALENDAR_SYNC_INTERVAL_MS + 1000,
+    );
+    expect(alarms).toHaveLength(1);
+
+    await store.snapshot();
+    await store.ensureAlarm();
+    expect(await store.ctx.storage.getAlarm()).toBe(armed);
+    expect(alarms).toHaveLength(1);
+
+    const sooner = Date.now() + 5_000;
+    await store.ctx.storage.setAlarm(sooner);
+    const scheduled = alarms.length;
+    await store.snapshot();
+    await store.execute(
+      "queue_project",
+      {
+        title: "Keep the sooner alarm",
+        areaId: "tech",
+        idempotencyKey: "rearm-sooner",
+        expectedVersions: f.engine.snapshot().versions,
+      },
+      actor,
+    );
+    expect(await store.ctx.storage.getAlarm()).toBe(sooner);
+    expect(alarms).toHaveLength(scheduled);
+    expect(alarms.at(-1)).toBe(sooner);
+  });
+
+  it("re-arms a missing alarm when the durable object starts", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const alarms: number[] = [];
+    let current: number | null = null;
+    let startup: Promise<void> = Promise.resolve();
+    const exec = (statement: string, ...bindings: unknown[]) => {
+      const prepared = f.sql.prepare(statement);
+      const rows = bindings.length
+        ? prepared.all(...(bindings as never[]))
+        : prepared.all();
+      return { toArray: () => rows };
+    };
+    const ctx = {
+      storage: {
+        sql: { exec },
+        transactionSync(callback: () => unknown) {
+          f.sql.exec("BEGIN");
+          try {
+            const result = callback();
+            f.sql.exec("COMMIT");
+            return result;
+          } catch (error) {
+            f.sql.exec("ROLLBACK");
+            throw error;
+          }
+        },
+        getAlarm: async () => current,
+        setAlarm: async (at: number) => {
+          current = at;
+          alarms.push(at);
+        },
+        deleteAlarm: async () => {
+          current = null;
+        },
+        kv: { get: () => undefined, put: () => undefined },
+      },
+      blockConcurrencyWhile(callback: () => Promise<void>) {
+        startup = callback();
+      },
+    };
+    new OrganizerStore(ctx as never, {} as never);
+    await startup;
+    expect(current).not.toBeNull();
+    const delay = current! - Date.now();
+    expect(delay).toBeGreaterThanOrEqual(CALENDAR_SYNC_INTERVAL_MS - 1000);
+    expect(delay).toBeLessThanOrEqual(CALENDAR_SYNC_INTERVAL_MS + 1000);
+    expect(alarms).toHaveLength(1);
+  });
+
+  it("schedules the next alarm when the handler hits the rows-read limit", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const { store, alarms } = storeFor(f);
+    store.schemaReady = true;
+    store.ctx.storage.sql = {
+      exec() {
+        throw new Error(
+          "Exceeded allowed rows read in Durable Objects free tier",
+        );
+      },
+    };
+    let reads = 0;
+    f.port.all = () => {
+      reads += 1;
+      if (reads === 1) void store.ctx.storage.setAlarm(Date.now() + 500);
+      throw new Error(
+        "Exceeded allowed rows read in Durable Objects free tier",
+      );
+    };
+    const started = Date.now();
+    await expect(store.alarm()).resolves.toBeUndefined();
+    const scheduled = alarms.at(-1)! - started;
+    expect(scheduled).toBeGreaterThanOrEqual(ALARM_RECOVERY_MS - 1000);
+    expect(scheduled).toBeLessThanOrEqual(ALARM_RECOVERY_MS + 1000);
+    expect(scheduled).toBeGreaterThan(60_000);
+  });
+
+  it("does not tighten the backoff across repeated alarm failures or ensure calls", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    f.port.all = () => {
+      throw new Error(
+        "Exceeded allowed rows read in Durable Objects free tier",
+      );
+    };
+    const { store, alarms } = storeFor(f);
+    const started = Date.now();
+    for (let attempt = 0; attempt < 4; attempt++)
+      await expect(
+        store.alarm({ retryCount: attempt, isRetry: attempt > 0 }),
+      ).resolves.toBeUndefined();
+    expect(alarms.length).toBeGreaterThan(0);
+    expect(alarms.length).toBeLessThanOrEqual(12);
+    for (const at of alarms) {
+      const delay = at - started;
+      expect(delay).toBeGreaterThanOrEqual(ALARM_RECOVERY_MS - 1000);
+      expect(delay).toBeLessThanOrEqual(ALARM_RECOVERY_MAX_MS + 1000);
+    }
+    const backedOff = await store.ctx.storage.getAlarm();
+    expect(backedOff! - Date.now()).toBeGreaterThan(60_000);
+
+    const quiet = fixture();
+    const idle = storeFor(quiet);
+    for (let n = 0; n < 20; n++) await idle.store.ensureAlarm();
+    expect(idle.alarms).toEqual([]);
+    expect(idle.deletedAlarms()).toBe(0);
+    expect(await idle.store.ctx.storage.getAlarm()).toBeNull();
+
+    await store.ensureAlarm();
+    expect(await store.ctx.storage.getAlarm()).toBe(backedOff);
+    expect(alarms.at(-1)).toBe(backedOff);
   });
 });
