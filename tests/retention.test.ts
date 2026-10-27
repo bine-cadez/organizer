@@ -2,6 +2,8 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OrganizerEngine, type DbPort } from "../src/domain/engine";
 import {
+  ALARM_ENSURE_INTERVAL_MS,
+  ALARM_HORIZON_MS,
   ALARM_RECOVERY_MAX_MS,
   ALARM_RECOVERY_MS,
   AUDIT_RETENTION_MS,
@@ -990,6 +992,93 @@ describe("alarm read budget", () => {
     expect(await store.ctx.storage.getAlarm()).toBe(sooner);
     expect(alarms).toHaveLength(scheduled);
     expect(alarms.at(-1)).toBe(sooner);
+  });
+
+  it("replaces an alarm more than a minute in the past", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const { store } = storeFor(f);
+    const stale = Date.now() - ALARM_ENSURE_INTERVAL_MS - 1_000;
+    await store.ctx.storage.setAlarm(stale);
+    const logged = vi.spyOn(console, "log").mockImplementation(() => {});
+    const started = Date.now();
+    await store.ensureAlarm();
+    const armed = await store.ctx.storage.getAlarm();
+    expect(armed).not.toBe(stale);
+    expect(armed! - started).toBeGreaterThanOrEqual(
+      CALENDAR_SYNC_INTERVAL_MS - 1000,
+    );
+    expect(armed! - started).toBeLessThanOrEqual(
+      CALENDAR_SYNC_INTERVAL_MS + 1000,
+    );
+    const checks = logged.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("alarm_check"))
+      .map(
+        (line) =>
+          JSON.parse(line) as { event: string; existing: number; now: number },
+      );
+    expect(checks).toEqual([
+      expect.objectContaining({ event: "alarm_check", existing: stale }),
+    ]);
+    expect(checks[0].now).toEqual(expect.any(Number));
+    logged.mockClear();
+    await store.ensureAlarm();
+    expect(await store.ctx.storage.getAlarm()).toBe(armed);
+    expect(
+      logged.mock.calls.some((call) => String(call[0]).includes("alarm_check")),
+    ).toBe(false);
+  });
+
+  it("replaces an alarm further out than the schedule horizon", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const { store, alarms } = storeFor(f);
+    const far = Date.now() + ALARM_HORIZON_MS + 60 * 60 * 1000;
+    await store.ctx.storage.setAlarm(far);
+    const started = Date.now();
+    await store.ensureAlarm();
+    const armed = await store.ctx.storage.getAlarm();
+    expect(armed).not.toBe(far);
+    expect(armed! - started).toBeGreaterThanOrEqual(
+      CALENDAR_SYNC_INTERVAL_MS - 1000,
+    );
+    expect(armed! - started).toBeLessThanOrEqual(
+      CALENDAR_SYNC_INTERVAL_MS + 1000,
+    );
+    expect(alarms.at(-1)).toBe(armed);
+  });
+
+  it("leaves a live future alarm where it is", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const { store, alarms } = storeFor(f);
+    const live = Date.now() + 5 * 60 * 1000;
+    await store.ctx.storage.setAlarm(live);
+    const scheduled = alarms.length;
+    const logged = vi.spyOn(console, "log").mockImplementation(() => {});
+    await store.ensureAlarm();
+    expect(await store.ctx.storage.getAlarm()).toBe(live);
+    expect(alarms).toHaveLength(scheduled);
+    const checks = logged.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("alarm_check"))
+      .map((line) => JSON.parse(line));
+    expect(checks).toEqual([
+      expect.objectContaining({ event: "alarm_check", existing: live }),
+    ]);
   });
 
   it("re-arms a missing alarm when the durable object starts", async () => {

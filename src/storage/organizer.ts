@@ -18,6 +18,7 @@ import type { AppEnv } from "../worker/env";
 import { addDays, dayBounds } from "../domain/time";
 import {
   ALARM_ENSURE_INTERVAL_MS,
+  ALARM_HORIZON_MS,
   ALARM_RECOVERY_MAX_MS,
   ALARM_RECOVERY_MS,
   CALENDAR_SYNC_INTERVAL_MS,
@@ -42,6 +43,8 @@ export class OrganizerStore extends DurableObject<AppEnv> {
   private foreignKeysOn = false;
   /** Skip schedule reads briefly after confirming there is nothing to arm. */
   private nextIdleAlarmProbeAt = 0;
+  /** One alarm_check log per wake interval, so a hot object does not spam. */
+  private nextAlarmCheckLogAt = 0;
   constructor(ctx: DurableObjectState, env: AppEnv) {
     super(ctx, env);
     const db: DbPort = {
@@ -62,7 +65,8 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     this.schemaReady = true;
     this.ensureForeignKeys();
     // Any wake (request or alarm) re-arms a platform-dropped alarm before
-    // other work. getAlarm() is metadata; arm() runs only when it is missing.
+    // other work. getAlarm() is metadata; arm() runs when it is missing or
+    // no longer a live schedule.
     ctx.blockConcurrencyWhile(() => this.ensureAlarm());
   }
   private ensureForeignKeys() {
@@ -269,9 +273,14 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     this.ensureForeignKeys();
     const result = this.engine.connectAccount(input);
     // Sync immediately after a connect, but do not delay an earlier alarm.
-    const soon = Date.now() + 100;
+    const now = Date.now();
+    const soon = now + 100;
     const existing = await this.ctx.storage.getAlarm();
-    if (existing == null || existing > soon)
+    if (
+      existing == null ||
+      this.alarmScheduleIsStale(existing, now) ||
+      existing > soon
+    )
       await this.ctx.storage.setAlarm(soon);
     return result;
   }
@@ -406,19 +415,44 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     }
   }
   /**
+   * A stored alarm the platform will not deliver. Slightly late delivery is
+   * still live; more than a minute overdue is not. Daily cleanup is the
+   * furthest real schedule, so anything past the horizon is not live either.
+   * arm() would otherwise keep a past timestamp because it is "earlier".
+   */
+  private alarmScheduleIsStale(existing: number, now: number): boolean {
+    return (
+      existing < now - ALARM_ENSURE_INTERVAL_MS ||
+      existing > now + ALARM_HORIZON_MS
+    );
+  }
+  private noteAlarmCheck(existing: number | null, now: number) {
+    if (now < this.nextAlarmCheckLogAt) return;
+    this.nextAlarmCheckLogAt = now + ALARM_ENSURE_INTERVAL_MS;
+    console.log(JSON.stringify({ event: "alarm_check", existing, now }));
+  }
+  /**
    * Restore a platform-dropped alarm. getAlarm() does not read SQL rows.
-   * Schedule reads run only when no alarm is set, and an earlier alarm is
-   * left where it is.
+   * A live earlier alarm is left where it is. A timestamp the platform has
+   * already given up on, or one further out than any schedule this object
+   * sets, is replaced.
    */
   async ensureAlarm(): Promise<void> {
     try {
+      const now = Date.now();
       const existing = await this.ctx.storage.getAlarm();
-      if (existing != null) {
+      this.noteAlarmCheck(existing, now);
+      const stale =
+        existing != null && this.alarmScheduleIsStale(existing, now);
+      if (existing != null && !stale) {
         this.nextIdleAlarmProbeAt = 0;
         return;
       }
-      if (Date.now() < this.nextIdleAlarmProbeAt) return;
-      await this.arm();
+      if (!stale && now < this.nextIdleAlarmProbeAt) return;
+      // ignoreAlarmAt stops arm() from keeping the dead timestamp as "earlier".
+      await this.arm(
+        stale ? { ignoreAlarmAt: existing ?? undefined } : undefined,
+      );
       if ((await this.ctx.storage.getAlarm()) == null)
         this.nextIdleAlarmProbeAt = Date.now() + ALARM_ENSURE_INTERVAL_MS;
       else {
@@ -432,11 +466,16 @@ export class OrganizerStore extends DurableObject<AppEnv> {
       );
       try {
         const again = await this.ctx.storage.getAlarm();
-        // A future alarm at least a minute out is not a hot loop. Anything
-        // sooner, or nothing, is replaced with the recovery backoff.
-        if (again != null && again > Date.now() + ALARM_ENSURE_INTERVAL_MS)
+        const recoveredAt = Date.now();
+        // A future alarm at least a minute out, and still inside the horizon,
+        // is not a hot loop. A past or far-future alarm is replaced.
+        if (
+          again != null &&
+          !this.alarmScheduleIsStale(again, recoveredAt) &&
+          again > recoveredAt + ALARM_ENSURE_INTERVAL_MS
+        )
           return;
-        await this.ctx.storage.setAlarm(Date.now() + ALARM_RECOVERY_MS);
+        await this.ctx.storage.setAlarm(recoveredAt + ALARM_RECOVERY_MS);
         console.log(JSON.stringify({ event: "alarm_rearmed" }));
       } catch (scheduleError) {
         console.error(

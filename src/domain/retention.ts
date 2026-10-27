@@ -23,6 +23,12 @@ export const ALARM_RECOVERY_MAX_MS = 60 * 60 * 1000;
  */
 export const ALARM_ENSURE_INTERVAL_MS = 60 * 1000;
 
+/**
+ * Furthest ahead this object schedules an alarm. Daily cleanup is 24 hours;
+ * a stored alarm further out than this is not a live schedule.
+ */
+export const ALARM_HORIZON_MS = 25 * 60 * 60 * 1000;
+
 /** Automatic sync looks this far behind and ahead of the local day. */
 export const CALENDAR_SYNC_PAST_MS = 7 * 24 * 60 * 60 * 1000;
 export const CALENDAR_SYNC_FUTURE_MS = 28 * 24 * 60 * 60 * 1000;

@@ -4,8 +4,8 @@ const nextTouchAt = new Map<string, number>();
 
 /**
  * Wake the owner's Durable Object often enough that a dropped alarm is
- * restored, without calling it on every MCP message. The object itself only
- * reads SQL when getAlarm() is null.
+ * restored, without calling it on every MCP message. The object reads SQL
+ * when getAlarm() is missing or no longer a live schedule.
  */
 export async function touchOrganizerAlarm(
   ownerSub: string,
