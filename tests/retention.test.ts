@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { OrganizerEngine, type DbPort } from "../src/domain/engine";
 import {
   ALARM_ENSURE_INTERVAL_MS,
+  ALARM_FAILURES_KEY,
   ALARM_HORIZON_MS,
   ALARM_RECOVERY_MAX_MS,
   ALARM_RECOVERY_MS,
@@ -136,6 +137,52 @@ function storeFor(f: ReturnType<typeof fixture>) {
     alarms,
     deletedAlarms: () => deletedAlarm,
   };
+}
+
+function bootingStore(
+  f: ReturnType<typeof fixture>,
+  initialAlarm: number | null,
+) {
+  const alarms: number[] = [];
+  let current: number | null = initialAlarm;
+  let startup: Promise<void> = Promise.resolve();
+  const exec = (statement: string, ...bindings: unknown[]) => {
+    const prepared = f.sql.prepare(statement);
+    const rows = bindings.length
+      ? prepared.all(...(bindings as never[]))
+      : prepared.all();
+    return { toArray: () => rows };
+  };
+  const ctx = {
+    storage: {
+      sql: { exec },
+      transactionSync(callback: () => unknown) {
+        f.sql.exec("BEGIN");
+        try {
+          const result = callback();
+          f.sql.exec("COMMIT");
+          return result;
+        } catch (error) {
+          f.sql.exec("ROLLBACK");
+          throw error;
+        }
+      },
+      getAlarm: async () => current,
+      setAlarm: async (at: number) => {
+        current = at;
+        alarms.push(at);
+      },
+      deleteAlarm: async () => {
+        current = null;
+      },
+      kv: { get: () => undefined, put: () => undefined },
+    },
+    blockConcurrencyWhile(callback: () => Promise<void>) {
+      startup = callback();
+    },
+  };
+  const store = new OrganizerStore(ctx as never, {} as never);
+  return { store, alarms, startup, alarm: () => current };
 }
 
 function accountId(f: ReturnType<typeof fixture>) {
@@ -436,9 +483,15 @@ describe("bookkeeping retention", () => {
         "INSERT INTO audit_log(id,actor_id,actor_type,action,entity_ids_json,summary,occurred_at) VALUES(?,?,'human',?,?,?,?)",
       )
       .run("audit-later", "owner", "note", "[]", "later", 1);
-    expect(f.engine.cleanupBookkeeping()).toEqual({
+    expect(f.engine.cleanupBookkeeping()).toMatchObject({
       more: true,
       deleted: CLEANUP_DAILY_ROW_BUDGET,
+      tables: {
+        calendar_events: tombstones,
+        command_receipts: CLEANUP_DAILY_ROW_BUDGET - tombstones,
+        outbox_operations: 0,
+        audit_log: 0,
+      },
     });
     expect(f.count("calendar_events")).toBe(0);
     expect(
@@ -751,9 +804,15 @@ describe("alarm read budget", () => {
         NOW,
         NOW,
       );
-    expect(f.engine.cleanupBookkeeping()).toEqual({
+    expect(f.engine.cleanupBookkeeping()).toMatchObject({
       more: false,
       deleted: CLEANUP_DAILY_ROW_BUDGET,
+      tables: {
+        calendar_events: CLEANUP_DAILY_ROW_BUDGET,
+        outbox_operations: 0,
+        command_receipts: 0,
+        audit_log: 0,
+      },
     });
     expect(f.count("calendar_events")).toBe(0);
   });
@@ -1142,19 +1201,8 @@ describe("alarm read budget", () => {
       email: "owner@example.test",
       encryptedCredentials: "encrypted",
     });
-    const { store, alarms } = storeFor(f);
-    store.schemaReady = true;
-    store.ctx.storage.sql = {
-      exec() {
-        throw new Error(
-          "Exceeded allowed rows read in Durable Objects free tier",
-        );
-      },
-    };
-    let reads = 0;
+    const { store, alarms, kv } = storeFor(f);
     f.port.all = () => {
-      reads += 1;
-      if (reads === 1) void store.ctx.storage.setAlarm(Date.now() + 500);
       throw new Error(
         "Exceeded allowed rows read in Durable Objects free tier",
       );
@@ -1165,6 +1213,248 @@ describe("alarm read budget", () => {
     expect(scheduled).toBeGreaterThanOrEqual(ALARM_RECOVERY_MS - 1000);
     expect(scheduled).toBeLessThanOrEqual(ALARM_RECOVERY_MS + 1000);
     expect(scheduled).toBeGreaterThan(60_000);
+    expect(kv.get(ALARM_FAILURES_KEY)).toBe(1);
+    expect(alarms).toHaveLength(1);
+  });
+
+  it("leaves an overdue alarm during startup and replaces it on a request", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const overdue = Date.now() - ALARM_ENSURE_INTERVAL_MS - 5_000;
+    const booted = bootingStore(f, overdue);
+    await booted.startup;
+    expect(booted.alarm()).toBe(overdue);
+    expect(booted.alarms).toEqual([]);
+    const started = Date.now();
+    await booted.store.ensureAlarm();
+    const armed = booted.alarm();
+    expect(armed).not.toBe(overdue);
+    expect(armed! - started).toBeGreaterThanOrEqual(
+      CALENDAR_SYNC_INTERVAL_MS - 1000,
+    );
+    expect(armed! - started).toBeLessThanOrEqual(
+      CALENDAR_SYNC_INTERVAL_MS + 1000,
+    );
+  });
+
+  it("replaces a far-future alarm during startup", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const far = Date.now() + ALARM_HORIZON_MS + 60 * 60 * 1000;
+    const booted = bootingStore(f, far);
+    await booted.startup;
+    const armed = booted.alarm();
+    expect(armed).not.toBe(far);
+    expect(armed! - Date.now()).toBeGreaterThanOrEqual(
+      CALENDAR_SYNC_INTERVAL_MS - 1000,
+    );
+    expect(armed! - Date.now()).toBeLessThanOrEqual(
+      CALENDAR_SYNC_INTERVAL_MS + 1000,
+    );
+  });
+
+  it("escalates the ensureAlarm recovery when arming throws", async () => {
+    const f = fixture();
+    f.port.all = () => {
+      throw new Error("rows_read exceeded");
+    };
+    const { store, kv } = storeFor(f);
+    const expected = [
+      ALARM_RECOVERY_MS,
+      ALARM_RECOVERY_MS * 2,
+      ALARM_RECOVERY_MAX_MS,
+    ];
+    for (let attempt = 0; attempt < expected.length; attempt++) {
+      await store.ctx.storage.deleteAlarm();
+      const started = Date.now();
+      await store.ensureAlarm();
+      const delay = (await store.ctx.storage.getAlarm())! - started;
+      expect(delay).toBeGreaterThanOrEqual(expected[attempt] - 1000);
+      expect(delay).toBeLessThanOrEqual(expected[attempt] + 1000);
+      expect(kv.get(ALARM_FAILURES_KEY)).toBe(attempt + 1);
+    }
+  });
+
+  it("escalates from memory when the failure count cannot be read", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    f.port.all = () => {
+      throw new Error("rows_read exceeded");
+    };
+    const { store, alarms, kv } = storeFor(f);
+    const realGet = store.ctx.storage.kv.get.bind(store.ctx.storage.kv);
+    const realPut = store.ctx.storage.kv.put.bind(store.ctx.storage.kv);
+    store.ctx.storage.kv.get = (key: string) => {
+      if (key === ALARM_FAILURES_KEY) throw new Error("rows_read exceeded");
+      return realGet(key);
+    };
+    store.ctx.storage.kv.put = (key: string, value: unknown) => {
+      if (key === ALARM_FAILURES_KEY) throw new Error("rows_read exceeded");
+      return realPut(key, value);
+    };
+    const expected = [
+      ALARM_RECOVERY_MS,
+      ALARM_RECOVERY_MS * 2,
+      ALARM_RECOVERY_MAX_MS,
+    ];
+    for (const delayMs of expected) {
+      const before = alarms.length;
+      const started = Date.now();
+      await store.alarm();
+      expect(alarms.length - before).toBe(1);
+      const delay = alarms.at(-1)! - started;
+      expect(delay).toBeGreaterThanOrEqual(delayMs - 1000);
+      expect(delay).toBeLessThanOrEqual(delayMs + 1000);
+    }
+    expect(kv.get(ALARM_FAILURES_KEY)).toBeUndefined();
+  });
+
+  it("logs per-table cleanup counts", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    f.sql
+      .prepare(
+        "INSERT INTO audit_log(id,actor_id,actor_type,action,entity_ids_json,summary,occurred_at) VALUES(?,?,'human',?,?,?,?)",
+      )
+      .run("old-1", "owner", "note", "[]", "old-1", 1);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ items: [], nextSyncToken: "token" })),
+    );
+    const { store } = storeFor(f);
+    const logged = vi.spyOn(console, "log").mockImplementation(() => {});
+    await store.alarm();
+    const cleanups = logged.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes('"event":"cleanup"'))
+      .map((line) => JSON.parse(line));
+    expect(cleanups).toEqual([
+      {
+        event: "cleanup",
+        more: false,
+        deleted: {
+          calendar_events: 0,
+          outbox_operations: 0,
+          command_receipts: 0,
+          audit_log: 1,
+        },
+      },
+    ]);
+  });
+
+  it("keeps a sooner alarm armed during a failed run", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const { store } = storeFor(f);
+    let sooner = 0;
+    f.port.all = () => {
+      sooner = Date.now() + 2_000;
+      void store.ctx.storage.setAlarm(sooner);
+      throw new Error(
+        "Exceeded allowed rows read in Durable Objects free tier",
+      );
+    };
+    await expect(store.alarm()).resolves.toBeUndefined();
+    expect(sooner).toBeGreaterThan(Date.now());
+    expect(await store.ctx.storage.getAlarm()).toBe(sooner);
+  });
+
+  it("escalates consecutive alarm failures from 15 to 30 to 60 minutes and resets after success", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const original = f.port.all.bind(f.port);
+    f.port.all = () => {
+      throw new Error(
+        "Exceeded allowed rows read in Durable Objects free tier",
+      );
+    };
+    const { store, kv } = storeFor(f);
+    const expected = [
+      ALARM_RECOVERY_MS,
+      ALARM_RECOVERY_MS * 2,
+      ALARM_RECOVERY_MAX_MS,
+      ALARM_RECOVERY_MAX_MS,
+    ];
+    for (let attempt = 0; attempt < expected.length; attempt++) {
+      const started = Date.now();
+      await expect(store.alarm()).resolves.toBeUndefined();
+      const delay = (await store.ctx.storage.getAlarm())! - started;
+      expect(delay).toBeGreaterThanOrEqual(expected[attempt] - 1000);
+      expect(delay).toBeLessThanOrEqual(expected[attempt] + 1000);
+      expect(kv.get(ALARM_FAILURES_KEY)).toBe(attempt + 1);
+    }
+
+    f.port.all = original;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ items: [], nextSyncToken: "token" })),
+    );
+    await store.alarm();
+    expect(kv.get(ALARM_FAILURES_KEY) ?? 0).toBe(0);
+
+    f.port.all = () => {
+      throw new Error(
+        "Exceeded allowed rows read in Durable Objects free tier",
+      );
+    };
+    const again = Date.now();
+    await store.alarm();
+    const reset = (await store.ctx.storage.getAlarm())! - again;
+    expect(reset).toBeGreaterThanOrEqual(ALARM_RECOVERY_MS - 1000);
+    expect(reset).toBeLessThanOrEqual(ALARM_RECOVERY_MS + 1000);
+    expect(kv.get(ALARM_FAILURES_KEY)).toBe(1);
+  });
+
+  it("skips alarm writes when foreign keys cannot be enabled", async () => {
+    const f = fixture();
+    f.engine.connectAccount({
+      role: "personal",
+      email: "owner@example.test",
+      encryptedCredentials: "encrypted",
+    });
+    const { store, kv } = storeFor(f);
+    store.schemaReady = true;
+    store.ctx.storage.sql = {
+      exec() {
+        throw new Error(
+          "Exceeded allowed rows read in Durable Objects free tier",
+        );
+      },
+    };
+    const cleanup = vi.spyOn(f.engine, "cleanupBookkeeping");
+    const due = vi.spyOn(f.engine, "dueOperations");
+    const started = Date.now();
+    await expect(store.alarm()).resolves.toBeUndefined();
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(due).not.toHaveBeenCalled();
+    const scheduled = (await store.ctx.storage.getAlarm())! - started;
+    expect(scheduled).toBeGreaterThanOrEqual(ALARM_RECOVERY_MS - 1000);
+    expect(scheduled).toBeLessThanOrEqual(ALARM_RECOVERY_MS + 1000);
+    expect(kv.get(ALARM_FAILURES_KEY)).toBe(1);
   });
 
   it("does not tighten the backoff across repeated alarm failures or ensure calls", async () => {
@@ -1182,9 +1472,7 @@ describe("alarm read budget", () => {
     const { store, alarms } = storeFor(f);
     const started = Date.now();
     for (let attempt = 0; attempt < 4; attempt++)
-      await expect(
-        store.alarm({ retryCount: attempt, isRetry: attempt > 0 }),
-      ).resolves.toBeUndefined();
+      await expect(store.alarm()).resolves.toBeUndefined();
     expect(alarms.length).toBeGreaterThan(0);
     expect(alarms.length).toBeLessThanOrEqual(12);
     for (const at of alarms) {

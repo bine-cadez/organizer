@@ -3704,8 +3704,20 @@ export class OrganizerEngine {
   cleanupBookkeeping(limit = CLEANUP_DAILY_ROW_BUDGET): {
     more: boolean;
     deleted: number;
+    tables: {
+      calendar_events: number;
+      outbox_operations: number;
+      command_receipts: number;
+      audit_log: number;
+    };
   } {
-    if (limit <= 0) return { more: true, deleted: 0 };
+    const tables = {
+      calendar_events: 0,
+      outbox_operations: 0,
+      command_receipts: 0,
+      audit_log: 0,
+    };
+    if (limit <= 0) return { more: true, deleted: 0, tables };
     const now = this.now();
     const past = now - CALENDAR_PAST_RETENTION_MS;
     const future = now + CALENDAR_FUTURE_RETENTION_MS;
@@ -3713,50 +3725,63 @@ export class OrganizerEngine {
     const futureDate = localParts(future).date;
     let remaining = limit;
     let deleted = 0;
-    const statements: { sql: string; probe: string; bindings: any[] }[] = [
+    const statements: {
+      table: keyof typeof tables;
+      sql: string;
+      probe: string;
+      bindings: any[];
+    }[] = [
       {
+        table: "calendar_events",
         sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NOT NULL LIMIT ?) RETURNING rowid",
         probe:
           "SELECT rowid FROM calendar_events WHERE deleted_at IS NOT NULL LIMIT 1",
         bindings: [],
       },
       {
+        table: "calendar_events",
         sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND end_utc<=? LIMIT ?) RETURNING rowid",
         probe:
           "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND end_utc<=? LIMIT 1",
         bindings: [past],
       },
       {
+        table: "calendar_events",
         sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND start_utc>=? LIMIT ?) RETURNING rowid",
         probe:
           "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=0 AND start_utc>=? LIMIT 1",
         bindings: [future],
       },
       {
+        table: "calendar_events",
         sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND end_date<=? LIMIT ?) RETURNING rowid",
         probe:
           "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND end_date<=? LIMIT 1",
         bindings: [pastDate],
       },
       {
+        table: "calendar_events",
         sql: "DELETE FROM calendar_events WHERE rowid IN (SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND start_date>? LIMIT ?) RETURNING rowid",
         probe:
           "SELECT rowid FROM calendar_events WHERE deleted_at IS NULL AND all_day=1 AND start_date>? LIMIT 1",
         bindings: [futureDate],
       },
       {
+        table: "outbox_operations",
         sql: "DELETE FROM outbox_operations WHERE rowid IN (SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','superseded') AND updated_at<? LIMIT ?) RETURNING rowid",
         probe:
           "SELECT rowid FROM outbox_operations WHERE state IN ('succeeded','superseded') AND updated_at<? LIMIT 1",
         bindings: [now - OUTBOX_RETENTION_MS],
       },
       {
+        table: "command_receipts",
         sql: "DELETE FROM command_receipts WHERE rowid IN (SELECT rowid FROM command_receipts WHERE committed_at<? LIMIT ?) RETURNING rowid",
         probe:
           "SELECT rowid FROM command_receipts WHERE committed_at<? LIMIT 1",
         bindings: [now - RECEIPT_RETENTION_MS],
       },
       {
+        table: "audit_log",
         sql: "DELETE FROM audit_log WHERE rowid IN (SELECT rowid FROM audit_log WHERE occurred_at<? LIMIT ?) RETURNING rowid",
         probe: "SELECT rowid FROM audit_log WHERE occurred_at<? LIMIT 1",
         bindings: [now - AUDIT_RETENTION_MS],
@@ -3764,21 +3789,23 @@ export class OrganizerEngine {
     ];
     const stillEligible = (probe: string, bindings: any[]) =>
       this.db.all(probe, ...bindings).length > 0;
-    for (const { sql, probe, bindings } of statements) {
+    const snapshot = () => ({ more: true, deleted, tables: { ...tables } });
+    for (const { table, sql, probe, bindings } of statements) {
       if (remaining <= 0) {
-        if (stillEligible(probe, bindings)) return { more: true, deleted };
+        if (stillEligible(probe, bindings)) return snapshot();
         continue;
       }
       while (remaining > 0) {
         const batch = Math.min(CLEANUP_BATCH_LIMIT, remaining);
         const removed = this.db.all(sql, ...bindings, batch);
+        tables[table] += removed.length;
         deleted += removed.length;
         remaining -= removed.length;
         if (removed.length < batch) break;
         if (remaining === 0 && stillEligible(probe, bindings))
-          return { more: true, deleted };
+          return snapshot();
       }
     }
-    return { more: false, deleted };
+    return { more: false, deleted, tables };
   }
 }
