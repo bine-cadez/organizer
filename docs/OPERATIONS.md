@@ -39,7 +39,7 @@ Deployment retains the existing Durable Object and KV bindings. Schema changes n
 ## Calendar recovery
 
 - Pending work is durable and ordered per booking. Stable IDs prevent duplicate inserts after ambiguous success.
-- The Durable Object alarm is re-armed on startup and by authenticated `/mcp` traffic if the platform has dropped it or left a stale schedule (more than a minute overdue, or more than 25 hours ahead). `alarm_check` logs the timestamp `getAlarm()` returned. A failed run, including the daily rows-read limit, schedules the next attempt 15–60 minutes later and does not leave the chain stopped.
+- The Durable Object alarm is re-armed on startup when it is missing or more than 25 hours ahead, and by authenticated `/mcp` traffic when it is missing, more than a minute overdue, or more than 25 hours ahead. Startup leaves an overdue alarm so a late platform retry can still run. `alarm_check` logs the timestamp `getAlarm()` returned. A failed run, including the daily rows-read limit, schedules the next attempt 15 minutes later, then 30, then 60, and does not leave the chain stopped. The wait resets after a run that finishes. A sooner alarm armed while the run was failing is kept. A run that cannot enable foreign keys schedules that attempt and does not write.
 - Retry failed operations after checking their current version. Create/move/resize can offer guarded Undo; deletion/lifecycle cleanup uses Retry or reconnect.
 - Reconnect the correct role in Settings when requested. Missing/stale data is not empty availability.
 - Google edits/deletions of observed bookings win. Work and arbitrary external events are never written.

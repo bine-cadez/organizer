@@ -2,11 +2,13 @@
 export const CALENDAR_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 
 /**
- * Delay before the alarm runs again after a failure (for example the daily
- * rows_read limit). Long enough that recovery is not a tight retry loop.
- * Cloudflare retries a thrown handler only a few times, starting at about
- * two seconds, and then deletes the alarm. The handler schedules this delay
- * itself and returns so the write is kept.
+ * Delay before the alarm runs again after the first consecutive failure (for
+ * example the daily rows_read limit). The second failure waits twice as long.
+ * The third and later wait ALARM_RECOVERY_MAX_MS. Cloudflare retries a thrown
+ * handler only a few times, starting at about two seconds, and then deletes
+ * the alarm. The handler schedules this delay itself and returns so the write
+ * is kept. The count lives in Durable Object storage because the handler does
+ * not rethrow, so the platform's retryCount stays at 0.
  */
 export const ALARM_RECOVERY_MS = 15 * 60 * 1000;
 
@@ -15,6 +17,9 @@ export const ALARM_RECOVERY_MS = 15 * 60 * 1000;
  * sooner than ALARM_RECOVERY_MS, and never uses a delay above this.
  */
 export const ALARM_RECOVERY_MAX_MS = 60 * 60 * 1000;
+
+/** Consecutive failed alarm runs. Reset after a run that finishes. */
+export const ALARM_FAILURES_KEY = "maintenance:alarm_failures";
 
 /**
  * How often a request path rechecks a missing alarm's schedule, and how often

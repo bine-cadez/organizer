@@ -18,6 +18,7 @@ import type { AppEnv } from "../worker/env";
 import { addDays, dayBounds } from "../domain/time";
 import {
   ALARM_ENSURE_INTERVAL_MS,
+  ALARM_FAILURES_KEY,
   ALARM_HORIZON_MS,
   ALARM_RECOVERY_MAX_MS,
   ALARM_RECOVERY_MS,
@@ -45,6 +46,8 @@ export class OrganizerStore extends DurableObject<AppEnv> {
   private nextIdleAlarmProbeAt = 0;
   /** One alarm_check log per wake interval, so a hot object does not spam. */
   private nextAlarmCheckLogAt = 0;
+  /** Last known consecutive alarm failures, used when storage cannot be read. */
+  private alarmFailuresInMemory = 0;
   constructor(ctx: DurableObjectState, env: AppEnv) {
     super(ctx, env);
     const db: DbPort = {
@@ -64,10 +67,12 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     this.engine = new OrganizerEngine(db);
     this.schemaReady = true;
     this.ensureForeignKeys();
-    // Any wake (request or alarm) re-arms a platform-dropped alarm before
-    // other work. getAlarm() is metadata; arm() runs when it is missing or
-    // no longer a live schedule.
-    ctx.blockConcurrencyWhile(() => this.ensureAlarm());
+    // Any wake re-arms a dropped alarm before other work. getAlarm() is
+    // metadata. Construction does not replace an overdue alarm: the platform
+    // may still deliver that late retry. Requests do.
+    ctx.blockConcurrencyWhile(() =>
+      this.ensureAlarm({ replaceOverdue: false }),
+    );
   }
   private ensureForeignKeys() {
     if (!this.schemaReady || this.foreignKeysOn) return;
@@ -420,11 +425,13 @@ export class OrganizerStore extends DurableObject<AppEnv> {
    * furthest real schedule, so anything past the horizon is not live either.
    * arm() would otherwise keep a past timestamp because it is "earlier".
    */
-  private alarmScheduleIsStale(existing: number, now: number): boolean {
-    return (
-      existing < now - ALARM_ENSURE_INTERVAL_MS ||
-      existing > now + ALARM_HORIZON_MS
-    );
+  private alarmScheduleIsStale(
+    existing: number,
+    now: number,
+    replaceOverdue = true,
+  ): boolean {
+    if (existing > now + ALARM_HORIZON_MS) return true;
+    return replaceOverdue && existing < now - ALARM_ENSURE_INTERVAL_MS;
   }
   private noteAlarmCheck(existing: number | null, now: number) {
     if (now < this.nextAlarmCheckLogAt) return;
@@ -437,13 +444,15 @@ export class OrganizerStore extends DurableObject<AppEnv> {
    * already given up on, or one further out than any schedule this object
    * sets, is replaced.
    */
-  async ensureAlarm(): Promise<void> {
+  async ensureAlarm(options?: { replaceOverdue?: boolean }): Promise<void> {
+    const replaceOverdue = options?.replaceOverdue !== false;
     try {
       const now = Date.now();
       const existing = await this.ctx.storage.getAlarm();
       this.noteAlarmCheck(existing, now);
       const stale =
-        existing != null && this.alarmScheduleIsStale(existing, now);
+        existing != null &&
+        this.alarmScheduleIsStale(existing, now, replaceOverdue);
       if (existing != null && !stale) {
         this.nextIdleAlarmProbeAt = 0;
         return;
@@ -468,14 +477,22 @@ export class OrganizerStore extends DurableObject<AppEnv> {
         const again = await this.ctx.storage.getAlarm();
         const recoveredAt = Date.now();
         // A future alarm at least a minute out, and still inside the horizon,
-        // is not a hot loop. A past or far-future alarm is replaced.
-        if (
-          again != null &&
-          !this.alarmScheduleIsStale(again, recoveredAt) &&
-          again > recoveredAt + ALARM_ENSURE_INTERVAL_MS
-        )
-          return;
-        await this.ctx.storage.setAlarm(recoveredAt + ALARM_RECOVERY_MS);
+        // is not a hot loop. An overdue alarm is replaced only on the request
+        // path. A far-future alarm is replaced either way.
+        if (again != null) {
+          const overdue = again < recoveredAt - ALARM_ENSURE_INTERVAL_MS;
+          if (overdue && !replaceOverdue) return;
+          if (
+            !this.alarmScheduleIsStale(again, recoveredAt, replaceOverdue) &&
+            again > recoveredAt + ALARM_ENSURE_INTERVAL_MS
+          )
+            return;
+        }
+        const nextFailures = this.alarmFailureCount() + 1;
+        this.rememberAlarmFailures(nextFailures);
+        await this.ctx.storage.setAlarm(
+          recoveredAt + this.recoveryDelay(nextFailures),
+        );
         console.log(JSON.stringify({ event: "alarm_rearmed" }));
       } catch (scheduleError) {
         console.error(
@@ -499,14 +516,18 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     recoveryMs?: number;
   }) {
     if (options?.failed) {
-      // The daily rows-read limit outlives a short retry. Keeping a sooner
-      // alarm would run this handler again immediately, so failure always
-      // waits out the backoff. Success still refuses to delay an earlier alarm.
+      // The opening setAlarm already booked this backoff. Do not write it
+      // again. A command may have armed something sooner while the run was
+      // failing; that alarm is not ignoreAlarmAt and must stay.
       const delay = Math.min(
         ALARM_RECOVERY_MAX_MS,
         Math.max(ALARM_RECOVERY_MS, options.recoveryMs ?? ALARM_RECOVERY_MS),
       );
-      await this.ctx.storage.setAlarm(Date.now() + delay);
+      const recovery = Date.now() + delay;
+      const existing = await this.ctx.storage.getAlarm();
+      if (existing != null && existing === options.ignoreAlarmAt) return;
+      if (existing != null && existing <= recovery) return;
+      await this.ctx.storage.setAlarm(recovery);
       return;
     }
     this.ensureForeignKeys();
@@ -541,10 +562,43 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     }
     await this.ctx.storage.setAlarm(next);
   }
-  /** Failure backoff: 15 minutes, plus 15 per platform retry, capped at an hour. */
-  private recoveryDelay(attempt = 0) {
-    const steps = Math.min(Math.max(0, attempt), 3);
-    return Math.min(ALARM_RECOVERY_MAX_MS, ALARM_RECOVERY_MS * (steps + 1));
+  /**
+   * 15 minutes on the first consecutive failure, 30 on the second, 60 after that.
+   * `consecutiveFailures` counts this run once it has failed.
+   */
+  private recoveryDelay(consecutiveFailures: number) {
+    const step = Math.min(Math.max(1, consecutiveFailures), 3);
+    return Math.min(ALARM_RECOVERY_MAX_MS, ALARM_RECOVERY_MS * 2 ** (step - 1));
+  }
+  private alarmFailureCount(): number {
+    try {
+      const stored = this.ctx.storage.kv?.get<number>(ALARM_FAILURES_KEY);
+      const count =
+        typeof stored === "number" && Number.isFinite(stored) && stored > 0
+          ? Math.floor(stored)
+          : 0;
+      this.alarmFailuresInMemory = count;
+      return count;
+    } catch (error) {
+      console.error(
+        "organizer alarm could not read failure count",
+        error instanceof Error ? error.message : error,
+      );
+      const remembered = this.alarmFailuresInMemory ?? 0;
+      return remembered > 0 ? remembered : 0;
+    }
+  }
+  private rememberAlarmFailures(count: number) {
+    const next = Math.max(0, Math.floor(count));
+    this.alarmFailuresInMemory = next;
+    try {
+      this.ctx.storage.kv?.put(ALARM_FAILURES_KEY, next);
+    } catch (error) {
+      console.error(
+        "organizer alarm could not record failure count",
+        error instanceof Error ? error.message : error,
+      );
+    }
   }
   private cleanupIfDue(): boolean {
     const now = Date.now();
@@ -561,6 +615,13 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     const result = this.engine.cleanupBookkeeping(
       CLEANUP_DAILY_ROW_BUDGET - already,
     );
+    console.log(
+      JSON.stringify({
+        event: "cleanup",
+        deleted: result.tables,
+        more: result.more,
+      }),
+    );
     this.ctx.storage.kv.put(CLEANUP_PROGRESS_KEY, {
       startedAt: progress?.startedAt ?? now,
       deleted: already + result.deleted,
@@ -568,13 +629,17 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     if (!result.more) this.ctx.storage.kv.put(CLEANUP_AT_KEY, now);
     return result.more;
   }
-  async alarm(alarmInfo?: AlarmInvocationInfo) {
+  async alarm(_alarmInfo?: AlarmInvocationInfo) {
     // setAlarm writes. On workerd that opens the event's implicit transaction
     // and every later PRAGMA foreign_keys=ON is ignored, so re-enable first.
-    // A rows-read failure here must not skip scheduling.
+    // If that fails, this run must not write with foreign keys off.
+    let failed = false;
+    let skipWrites = false;
     try {
       this.ensureForeignKeys();
     } catch (error) {
+      failed = true;
+      skipWrites = true;
       console.error(
         "organizer alarm could not enable foreign keys",
         error instanceof Error ? error.message : error,
@@ -583,8 +648,19 @@ export class OrganizerStore extends DurableObject<AppEnv> {
     // Schedule recovery before doing work. Platform retries are finite and
     // start at about two seconds; once they are exhausted the alarm is gone.
     // Returning after setAlarm commits the next run instead of rethrowing.
+    // retryCount stays 0 because this handler does not rethrow, so the delay
+    // follows the stored consecutive-failure count instead.
+    let priorFailures = 0;
+    try {
+      priorFailures = this.alarmFailureCount();
+    } catch (error) {
+      console.error(
+        "organizer alarm could not read failure count",
+        error instanceof Error ? error.message : error,
+      );
+    }
     const alarmStartedAt = Date.now();
-    const recoveryMs = this.recoveryDelay(alarmInfo?.retryCount ?? 0);
+    const recoveryMs = this.recoveryDelay(priorFailures + 1);
     let scheduled = false;
     let recoveryAt: number | undefined;
     try {
@@ -597,161 +673,179 @@ export class OrganizerStore extends DurableObject<AppEnv> {
         error instanceof Error ? error.message : error,
       );
     }
-    let failed = false;
     let cleanupPending = false;
     let claimed = 0;
-    try {
-      cleanupPending = this.cleanupIfDue();
-    } catch (error) {
-      failed = true;
-      console.error(
-        "organizer cleanup failed",
-        error instanceof Error ? error.message : error,
-      );
+    if (!skipWrites) {
+      try {
+        cleanupPending = this.cleanupIfDue();
+      } catch (error) {
+        failed = true;
+        console.error(
+          "organizer cleanup failed",
+          error instanceof Error ? error.message : error,
+        );
+      }
     }
-    try {
-      for (const operation of this.engine.dueOperations(10)) {
-        const work = this.engine.claimOperation(operation.id);
-        if (!work) continue;
-        claimed += 1;
-        try {
-          if (!work.account)
-            throw new CalendarProviderError(
-              "Reconnect this calendar account.",
-              "RECONNECT_REQUIRED",
-              401,
-              false,
-              true,
+    if (!skipWrites) {
+      try {
+        for (const operation of this.engine.dueOperations(10)) {
+          const work = this.engine.claimOperation(operation.id);
+          if (!work) continue;
+          claimed += 1;
+          try {
+            if (!work.account)
+              throw new CalendarProviderError(
+                "Reconnect this calendar account.",
+                "RECONNECT_REQUIRED",
+                401,
+                false,
+                true,
+              );
+            if (work.action === "sync") {
+              await this.synchronize(work.account.role);
+              this.engine.completeOperation(operation.id);
+              continue;
+            }
+            if (
+              work.account.role !== "personal" ||
+              !work.booking ||
+              !work.ticket
+            )
+              throw new CalendarProviderError(
+                "Only Organizer ticket bookings on Personal can be changed.",
+                "CALENDAR_WRITE_FORBIDDEN",
+                403,
+              );
+            const google = new GoogleCalendar(
+              (await this.credentials("personal")).accessToken,
             );
-          if (work.action === "sync") {
-            await this.synchronize(work.account.role);
-            this.engine.completeOperation(operation.id);
-            continue;
-          }
-          if (work.account.role !== "personal" || !work.booking || !work.ticket)
-            throw new CalendarProviderError(
-              "Only Organizer ticket bookings on Personal can be changed.",
-              "CALENDAR_WRITE_FORBIDDEN",
-              403,
-            );
-          const google = new GoogleCalendar(
-            (await this.credentials("personal")).accessToken,
-          );
-          const booking = work.booking;
-          if (work.action === "delete") {
-            await google.remove(booking.calendarId, booking.googleEventId);
-            this.engine.completeOperation(operation.id);
-          } else {
-            const create = () =>
-              google.create(booking.calendarId, {
-                id: booking.googleEventId,
-                ticketId: work.ticket!.id,
-                bookingId: booking.id,
-                title: String(work.payload.summary || work.ticket!.title),
-                projectTitle: String(
-                  work.payload.projectTitle || work.project?.title || "",
-                ),
-                start: String(work.payload.start || booking.start),
-                end: String(work.payload.end || booking.end),
-              });
-            let event;
-            if (work.action === "create") event = await create();
-            else {
-              try {
-                event = await google.patch(
-                  booking.calendarId,
-                  booking.googleEventId,
-                  {
-                    start:
-                      typeof work.payload.start === "string"
-                        ? work.payload.start
-                        : undefined,
-                    end:
-                      typeof work.payload.end === "string"
-                        ? work.payload.end
-                        : undefined,
-                    title:
-                      typeof work.payload.summary === "string"
-                        ? work.payload.summary
-                        : undefined,
-                  },
-                  work.expectedRemoteEtag,
-                );
-              } catch (error) {
-                if (
-                  !(error instanceof CalendarProviderError) ||
-                  ![404, 410].includes(error.status)
-                )
-                  throw error;
-                if (
-                  booking.remoteStart ||
-                  booking.remoteEnd ||
-                  work.expectedRemoteEtag
-                ) {
-                  // A previously observed occurrence disappeared in Google. Never resurrect it.
-                  this.engine.reconcileCalendar({
-                    role: "personal",
-                    calendarId: booking.calendarId,
-                    events: [
-                      { googleEventId: booking.googleEventId, deleted: true },
-                    ],
-                    partial: true,
-                  });
-                  this.engine.completeOperation(operation.id);
-                  continue;
+            const booking = work.booking;
+            if (work.action === "delete") {
+              await google.remove(booking.calendarId, booking.googleEventId);
+              this.engine.completeOperation(operation.id);
+            } else {
+              const create = () =>
+                google.create(booking.calendarId, {
+                  id: booking.googleEventId,
+                  ticketId: work.ticket!.id,
+                  bookingId: booking.id,
+                  title: String(work.payload.summary || work.ticket!.title),
+                  projectTitle: String(
+                    work.payload.projectTitle || work.project?.title || "",
+                  ),
+                  start: String(work.payload.start || booking.start),
+                  end: String(work.payload.end || booking.end),
+                });
+              let event;
+              if (work.action === "create") event = await create();
+              else {
+                try {
+                  event = await google.patch(
+                    booking.calendarId,
+                    booking.googleEventId,
+                    {
+                      start:
+                        typeof work.payload.start === "string"
+                          ? work.payload.start
+                          : undefined,
+                      end:
+                        typeof work.payload.end === "string"
+                          ? work.payload.end
+                          : undefined,
+                      title:
+                        typeof work.payload.summary === "string"
+                          ? work.payload.summary
+                          : undefined,
+                    },
+                    work.expectedRemoteEtag,
+                  );
+                } catch (error) {
+                  if (
+                    !(error instanceof CalendarProviderError) ||
+                    ![404, 410].includes(error.status)
+                  )
+                    throw error;
+                  if (
+                    booking.remoteStart ||
+                    booking.remoteEnd ||
+                    work.expectedRemoteEtag
+                  ) {
+                    // A previously observed occurrence disappeared in Google. Never resurrect it.
+                    this.engine.reconcileCalendar({
+                      role: "personal",
+                      calendarId: booking.calendarId,
+                      events: [
+                        { googleEventId: booking.googleEventId, deleted: true },
+                      ],
+                      partial: true,
+                    });
+                    this.engine.completeOperation(operation.id);
+                    continue;
+                  }
+                  // Recovery for an occurrence whose original insert was never observed. Reuse
+                  // the same identity; a provider tombstone/identity conflict is not a new event.
+                  event = await create();
                 }
-                // Recovery for an occurrence whose original insert was never observed. Reuse
-                // the same identity; a provider tombstone/identity conflict is not a new event.
-                event = await create();
+              }
+              this.engine.completeOperation(operation.id, {
+                remoteEvent: projectEvent(event),
+              });
+            }
+          } catch (error) {
+            const problem =
+              error instanceof CalendarProviderError
+                ? error
+                : new CalendarProviderError(
+                    "Calendar synchronization failed. Retry after checking the connection.",
+                    "PROVIDER_UNAVAILABLE",
+                    503,
+                    true,
+                  );
+            if (problem.code === "VERSION_CONFLICT" && work.account) {
+              try {
+                await this.synchronize(work.account.role);
+              } catch {
+                /* The failed operation remains visible for recovery. */
               }
             }
-            this.engine.completeOperation(operation.id, {
-              remoteEvent: projectEvent(event),
+            this.engine.failOperation(operation.id, {
+              code: problem.code,
+              message: problem.message,
+              retryable: problem.retryable,
+              needsReconnect: problem.needsReconnect,
             });
           }
-        } catch (error) {
-          const problem =
-            error instanceof CalendarProviderError
-              ? error
-              : new CalendarProviderError(
-                  "Calendar synchronization failed. Retry after checking the connection.",
-                  "PROVIDER_UNAVAILABLE",
-                  503,
-                  true,
-                );
-          if (problem.code === "VERSION_CONFLICT" && work.account) {
-            try {
-              await this.synchronize(work.account.role);
-            } catch {
-              /* The failed operation remains visible for recovery. */
-            }
+        }
+        for (const role of this.engine.connectionsDueForSync(
+          Date.now() - CALENDAR_SYNC_INTERVAL_MS,
+        )) {
+          try {
+            await this.synchronize(role);
+          } catch (error) {
+            if (error instanceof CalendarProviderError) {
+              if (error.needsReconnect)
+                this.engine.setAccountStatus(role, "needs_reconnect");
+            } else throw error;
           }
-          this.engine.failOperation(operation.id, {
-            code: problem.code,
-            message: problem.message,
-            retryable: problem.retryable,
-            needsReconnect: problem.needsReconnect,
-          });
         }
+      } catch (error) {
+        failed = true;
+        console.error(
+          "organizer alarm failed",
+          error instanceof Error ? error.message : error,
+        );
       }
-      for (const role of this.engine.connectionsDueForSync(
-        Date.now() - CALENDAR_SYNC_INTERVAL_MS,
-      )) {
-        try {
-          await this.synchronize(role);
-        } catch (error) {
-          if (error instanceof CalendarProviderError) {
-            if (error.needsReconnect)
-              this.engine.setAccountStatus(role, "needs_reconnect");
-          } else throw error;
-        }
+    }
+    const nextFailures = failed ? priorFailures + 1 : 0;
+    if (nextFailures !== priorFailures) {
+      try {
+        this.rememberAlarmFailures(nextFailures);
+      } catch (error) {
+        console.error(
+          "organizer alarm could not record failure count",
+          error instanceof Error ? error.message : error,
+        );
       }
-    } catch (error) {
-      failed = true;
-      console.error(
-        "organizer alarm failed",
-        error instanceof Error ? error.message : error,
-      );
     }
     try {
       await this.arm({
